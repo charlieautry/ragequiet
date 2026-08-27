@@ -14,6 +14,7 @@ use crate::bridge::{self, Command, CommandTx, SharedLevels};
 use crate::config::{CalibrationState, Config};
 use crate::detector::{Detector, GREEN, GREY};
 use crate::engine::Engine;
+use crate::ui;
 use crate::{alert, audio};
 
 /// Rare events pushed from the audio callback to the UI.
@@ -191,7 +192,7 @@ impl App {
     }
 
     pub fn theme(&self, _window: window::Id) -> Theme {
-        Theme::Dark
+        crate::ui::theme::theme()
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -263,7 +264,23 @@ impl App {
         if Some(window_id) != self.settings_window {
             return column![].into();
         }
-        container(text("settings")).padding(20).into()
+        let title = text("Ragequiet")
+            .font(ui::theme::FONT_SEMIBOLD)
+            .size(24)
+            .color(ui::theme::TEXT);
+        let subtitle = text("settings window")
+            .font(ui::theme::FONT_REGULAR)
+            .size(14)
+            .color(ui::theme::TEXT_MUTED);
+        container(column![title, subtitle].spacing(8))
+            .width(iced::Length::Fill)
+            .height(iced::Length::Fill)
+            .padding(20)
+            .style(|_theme: &Theme| container::Style {
+                background: Some(ui::theme::BACKGROUND.into()),
+                ..container::Style::default()
+            })
+            .into()
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
