@@ -43,8 +43,7 @@ mod tests {
     fn stereo_is_averaged_to_mono() {
         // 16 kHz stereo in (no resampling): L=0.8, R=0.2 -> mono 0.5
         let mut fb = FrameBuilder::new(SAMPLE_RATE, 2);
-        let interleaved: Vec<f32> = std::iter::repeat([0.8f32, 0.2f32])
-            .take(FRAME_SIZE)
+        let interleaved: Vec<f32> = std::iter::repeat_n([0.8f32, 0.2f32], FRAME_SIZE)
             .flatten()
             .collect();
         let mut frames = 0;
