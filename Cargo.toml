@@ -7,6 +7,8 @@ edition = "2024"
 anyhow = "1.0.104"
 cpal = "0.18.2"
 realfft = "3.5.0"
+tao = "0.37.0"
+tray-icon = "0.24.2"
 
 [profile.release]
 lto = "thin"
