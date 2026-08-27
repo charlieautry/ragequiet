@@ -29,7 +29,13 @@ pub struct Engine {
     tilt_baseline: RollingMedian,
     noise_floor_db: f32,
     margin_db: f32,
+    unfed_streak: u32,
 }
+
+/// Voiced frames stuck above the feed cutoff (but not bright) for this many
+/// frames in a row are a level shift, not a shout: retrain the baseline
+/// instead of leaving the tray stuck yellow forever. ~5 s at 31 frames/sec.
+const RETRAIN_AFTER_FRAMES: u32 = 150;
 
 impl Engine {
     pub fn new() -> Self {
@@ -40,6 +46,7 @@ impl Engine {
             tilt_baseline: RollingMedian::new(600),
             noise_floor_db: -55.0,
             margin_db: 7.0,
+            unfed_streak: 0,
         }
     }
 
@@ -56,13 +63,26 @@ impl Engine {
 
         let threshold = self.level_baseline.median().unwrap_or(db) + self.margin_db;
         let tilt_ref = self.tilt_baseline.median().unwrap_or(feat.tilt_db);
+        let bright = feat.tilt_db > tilt_ref + 3.0;
         // Only calm frames feed the baselines, so a long shout can't raise the threshold.
         if db < threshold - 3.0 {
             self.level_baseline.push(db);
             self.tilt_baseline.push(feat.tilt_db);
+            self.unfed_streak = 0;
+        } else if bright {
+            // Genuine shouting: never let it drag the baseline up.
+            self.unfed_streak = 0;
+        } else {
+            // Voiced, above the feed cutoff, but not bright: could be a mic
+            // gain step rather than a raised voice. Let it retrain once it's
+            // persisted long enough that a shout would be implausible.
+            self.unfed_streak += 1;
+            if self.unfed_streak > RETRAIN_AFTER_FRAMES {
+                self.level_baseline.push(db);
+                self.tilt_baseline.push(feat.tilt_db);
+            }
         }
 
-        let bright = feat.tilt_db > tilt_ref + 3.0;
         if db >= threshold && bright {
             State::TooLoud { db }
         } else if db >= threshold - 3.0 {
@@ -152,5 +172,24 @@ mod tests {
         let mut e = Engine::new();
         let faint = mix(16000.0, FRAME_SIZE, &[(200.0, 0.0005)]); // ~-69 dB
         assert_eq!(e.process(&faint), State::Quiet);
+    }
+
+    #[test]
+    fn baseline_recovers_after_gain_step() {
+        let mut e = Engine::new();
+        let quiet = quiet_voice();
+        for _ in 0..50 {
+            e.process(&quiet);
+        }
+        // mic gain jumps +12 dB: same voice, 4x amplitude, same spectral shape
+        let boosted = mix(16000.0, FRAME_SIZE, &[(200.0, 0.08), (1500.0, 0.016)]);
+        let mut recovered = false;
+        for _ in 0..1000 {
+            if matches!(e.process(&boosted), State::Calm { .. }) {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(recovered, "engine never re-adapted to the new gain level");
     }
 }
