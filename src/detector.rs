@@ -1,4 +1,6 @@
 use crate::alert::AlertGate;
+use crate::bridge::MeasurementKind;
+use crate::engine::calibrate::Measurement;
 use crate::engine::{Engine, State};
 
 /// Which brand tray icon should be showing; the actual colors/pixels live in
@@ -23,6 +25,18 @@ pub struct FrameOutcome {
     /// Some(state) only when the tray icon must change.
     pub state_change: Option<TrayState>,
     pub beep: bool,
+    /// Some(..) only on a progress-percent change or on completion of an
+    /// active calibration measurement. Read from app.rs starting with the
+    /// calibration wizard (Phase 2c Task 2/3); until then only tests read it.
+    #[allow(dead_code)]
+    pub measurement: Option<MeasurementUpdate>,
+}
+
+/// Progress/completion events for an in-flight calibration measurement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MeasurementUpdate {
+    Progress(f32),
+    Complete(MeasurementKind, f32),
 }
 
 /// Level reported for frames the cascade rejected (silence / non-voice).
@@ -48,6 +62,10 @@ pub struct Detector {
     last_level_db: f32,
     peak_db: f32,
     peak_at_ms: u64,
+    /// Active calibration measurement, if any: kind, the pure accumulator,
+    /// and the last whole-percent progress value emitted for it (so repeat
+    /// frames at the same percent don't spam the UI).
+    measurement: Option<(MeasurementKind, Measurement, u32)>,
 }
 
 impl Detector {
@@ -60,17 +78,44 @@ impl Detector {
             last_level_db: SILENT_DB,
             peak_db: SILENT_DB,
             peak_at_ms: 0,
+            measurement: None,
         }
     }
 
     pub fn on_frame(&mut self, frame: &[f32], now_ms: u64) -> FrameOutcome {
+        // The measurement, if any, sees every frame first: it must not miss
+        // a sample to detection logic running underneath it.
+        let measuring = self.measurement.is_some();
+        let measurement = if let Some((kind, m, last_pct)) = self.measurement.as_mut() {
+            let kind = *kind;
+            if let Some(db) = m.push(frame) {
+                self.measurement = None;
+                Some(MeasurementUpdate::Complete(kind, db))
+            } else {
+                let p = m.progress();
+                let pct = (p * 100.0) as u32;
+                if pct != *last_pct {
+                    *last_pct = pct;
+                    Some(MeasurementUpdate::Progress(p))
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let state = self.engine.process(frame);
         // Test mode still drives the icon and the meter; it only mutes the
         // speaker, so the gate keeps running and its timing stays honest.
+        // Measurements suppress the beep the same way (the ceiling step asks
+        // the user to be loud on purpose) while still updating the gate so
+        // its cooldown state stays sane once the measurement ends.
         let beep = self
             .gate
             .update(matches!(state, State::TooLoud { .. }), now_ms)
-            && !self.test_mode;
+            && !self.test_mode
+            && !measuring;
         let level_db = level_of(state);
         self.last_level_db = level_db;
         // `>=`, not `>`: a frame that merely ties the peak is still a fresh
@@ -87,7 +132,7 @@ impl Detector {
         } else {
             None
         };
-        FrameOutcome { state_change, beep }
+        FrameOutcome { state_change, beep, measurement }
     }
 
     /// Called when monitoring resumes after a pause: the next frame must
@@ -123,6 +168,15 @@ impl Detector {
             } => self.gate = AlertGate::new(hold_ms, cooldown_ms),
             Command::SetTestMode(on) => self.test_mode = on,
             Command::SetEnabledIconBaseline => self.resume(),
+            Command::StartMeasurement(kind) => {
+                let m = match kind {
+                    MeasurementKind::NoiseFloor => Measurement::noise_floor(),
+                    MeasurementKind::QuietPoint => Measurement::voiced_level(8.0),
+                    MeasurementKind::Ceiling => Measurement::voiced_level(5.0),
+                };
+                self.measurement = Some((kind, m, 0));
+            }
+            Command::CancelMeasurement => self.measurement = None,
         }
     }
 }
@@ -287,6 +341,144 @@ mod tests {
         assert!(d.on_frame(&silence(), 0).state_change.is_none());
         d.apply(crate::bridge::Command::SetEnabledIconBaseline);
         assert_eq!(d.on_frame(&silence(), 32).state_change, Some(TrayState::Quiet));
+    }
+
+    fn silent_frame_at(now: u64, d: &mut Detector) -> FrameOutcome {
+        d.on_frame(&silence(), now)
+    }
+
+    #[test]
+    fn noise_floor_measurement_completes_on_silence() {
+        let mut d = test_detector();
+        d.apply(crate::bridge::Command::StartMeasurement(
+            crate::bridge::MeasurementKind::NoiseFloor,
+        ));
+        let mut completed = None;
+        for i in 0..200u64 {
+            let out = silent_frame_at(i * FRAME_MS, &mut d);
+            if let Some(MeasurementUpdate::Complete(kind, db)) = out.measurement {
+                completed = Some((kind, db));
+                break;
+            }
+        }
+        let (kind, db) = completed.expect("noise floor measurement did not complete");
+        assert_eq!(kind, crate::bridge::MeasurementKind::NoiseFloor);
+        assert!(db <= -60.0, "expected a plausible silent noise floor, got {db}");
+
+        // measurement is cleared after completion: the very next frame emits nothing
+        let out = silent_frame_at(200 * FRAME_MS, &mut d);
+        assert!(out.measurement.is_none(), "measurement must clear after completion");
+    }
+
+    #[test]
+    fn quiet_point_measurement_ignores_silence_then_completes_on_voice() {
+        let mut d = test_detector();
+        d.apply(crate::bridge::Command::StartMeasurement(
+            crate::bridge::MeasurementKind::QuietPoint,
+        ));
+        let mut emitted_progress = 0u32;
+        for i in 0..50u64 {
+            let out = silent_frame_at(i * FRAME_MS, &mut d);
+            match out.measurement {
+                Some(MeasurementUpdate::Progress(p)) => {
+                    assert_eq!(p, 0.0, "silence must not advance quiet-point progress");
+                    emitted_progress += 1;
+                }
+                Some(MeasurementUpdate::Complete(..)) => panic!("silence must not complete a voiced measurement"),
+                None => {}
+            }
+        }
+        assert_eq!(emitted_progress, 0, "silence must not emit any progress events");
+
+        let voice = quiet_voice();
+        let mut completed = None;
+        for i in 0..400u64 {
+            let now = 50 * FRAME_MS + i * FRAME_MS;
+            let out = d.on_frame(&voice, now);
+            if let Some(MeasurementUpdate::Complete(kind, db)) = out.measurement {
+                completed = Some((kind, db));
+                break;
+            }
+        }
+        let (kind, db) = completed.expect("quiet point measurement did not complete on voiced frames");
+        assert_eq!(kind, crate::bridge::MeasurementKind::QuietPoint);
+        assert!((-40.0..=-34.0).contains(&db), "got {db}");
+    }
+
+    #[test]
+    fn progress_events_emit_only_on_whole_percent_change() {
+        let mut d = test_detector();
+        d.apply(crate::bridge::Command::StartMeasurement(
+            crate::bridge::MeasurementKind::QuietPoint,
+        ));
+        let voice = quiet_voice();
+        let mut emitted_pcts = Vec::new();
+        let mut completed = false;
+        for i in 0..400u64 {
+            let now = i * FRAME_MS;
+            let out = d.on_frame(&voice, now);
+            match out.measurement {
+                Some(MeasurementUpdate::Progress(p)) => emitted_pcts.push((p * 100.0) as u32),
+                Some(MeasurementUpdate::Complete(..)) => {
+                    completed = true;
+                    break;
+                }
+                None => {}
+            }
+        }
+        assert!(completed, "measurement should complete within 400 voiced frames");
+        assert!(!emitted_pcts.is_empty(), "expected at least one progress event");
+        // no spam: every emitted percent must be strictly greater than the last
+        let mut last = None;
+        for &p in &emitted_pcts {
+            if let Some(prev) = last {
+                assert!(p > prev, "progress percent must strictly increase, got {emitted_pcts:?}");
+            }
+            last = Some(p);
+        }
+        let distinct_crossed = emitted_pcts.last().copied().unwrap_or(0) - emitted_pcts.first().copied().unwrap_or(0) + 1;
+        assert!(
+            emitted_pcts.len() as u32 <= distinct_crossed,
+            "emitted {} progress events but only {} distinct percents were crossed",
+            emitted_pcts.len(),
+            distinct_crossed
+        );
+    }
+
+    #[test]
+    fn cancel_measurement_stops_updates() {
+        let mut d = test_detector();
+        d.apply(crate::bridge::Command::StartMeasurement(
+            crate::bridge::MeasurementKind::QuietPoint,
+        ));
+        let voice = quiet_voice();
+        // get a bit of progress going first
+        for i in 0..5u64 {
+            d.on_frame(&voice, i * FRAME_MS);
+        }
+        d.apply(crate::bridge::Command::CancelMeasurement);
+        for i in 5..50u64 {
+            let out = d.on_frame(&voice, i * FRAME_MS);
+            assert!(out.measurement.is_none(), "frame {i} emitted a measurement update after cancel");
+        }
+    }
+
+    #[test]
+    fn beep_suppressed_during_measurement_then_functional_after_cancel() {
+        let mut d = test_detector();
+        let start = warm_up(&mut d);
+        d.apply(crate::bridge::Command::StartMeasurement(
+            crate::bridge::MeasurementKind::Ceiling,
+        ));
+        let loud = loud_voice();
+        for i in 0..40u64 {
+            let out = d.on_frame(&loud, start + i * FRAME_MS);
+            assert!(!out.beep, "beep must be suppressed during an active measurement (frame {i})");
+        }
+        d.apply(crate::bridge::Command::CancelMeasurement);
+        let resume_start = start + 40 * FRAME_MS;
+        let fired = first_beep_offset_ms(&mut d, resume_start, 80);
+        assert!(fired.is_some(), "beep must be functional again after the measurement ends");
     }
 
     #[test]

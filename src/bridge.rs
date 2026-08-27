@@ -40,6 +40,19 @@ impl SharedLevels {
     }
 }
 
+/// Which calibration step is being measured; drives which `Measurement`
+/// constructor the detector uses and what completion event flows back.
+// Constructed from app.rs once the calibration wizard (Phase 2c Task 2/3)
+// sends `Command::StartMeasurement`; until then only the detector's own
+// tests build these.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MeasurementKind {
+    NoiseFloor,
+    QuietPoint,
+    Ceiling,
+}
+
 /// UI -> audio-callback commands. Drained with try_recv each frame (non-blocking).
 // The shared `Set` prefix is the point: every variant is an imperative write
 // into the live detector, and the names read correctly at the call site.
@@ -49,6 +62,11 @@ pub enum Command {
     SetGate { hold_ms: u64, cooldown_ms: u64 },
     SetTestMode(bool),
     SetEnabledIconBaseline, // resume(): re-announce color after enable toggle
+    // Sent from app.rs starting with the calibration wizard (Phase 2c Task 2/3).
+    #[allow(dead_code)]
+    StartMeasurement(MeasurementKind),
+    #[allow(dead_code)]
+    CancelMeasurement,
 }
 
 pub type CommandTx = std::sync::mpsc::Sender<Command>;

@@ -11,7 +11,6 @@ pub fn ceiling_is_sane(quiet_db: f32, ceiling_db: f32) -> bool {
 
 /// Collects per-frame levels and reports the median once enough frames arrived.
 /// Pure: the wizard UI feeds it frames and polls progress. Not hot-path code.
-#[allow(dead_code)] // used from the wizard UI on
 pub struct Measurement {
     samples: Vec<f32>,
     scratch: Vec<f32>,
@@ -21,7 +20,6 @@ pub struct Measurement {
     result: Option<f32>,
 }
 
-#[allow(dead_code)] // used from the wizard UI on
 impl Measurement {
     /// Ambient level: every frame counts. ~3 s per the wizard script.
     pub fn noise_floor() -> Self {
