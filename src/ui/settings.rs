@@ -3,7 +3,9 @@
 //! single column, generous spacing. The meter itself is a placeholder slot
 //! here; Task 4 mounts the real canvas.
 
-use iced::widget::{button, canvas, column, container, mouse_area, row, slider, space, text, toggler};
+use iced::widget::{
+    button, canvas, column, container, mouse_area, row, scrollable, slider, space, text, toggler,
+};
 use iced::{Alignment, Element, Length, Theme};
 
 use crate::app::{banner_visible, drift_nudge_visible, meta_threshold_db, App, Message};
@@ -65,7 +67,21 @@ pub fn view(app: &App) -> Element<'_, Message> {
         }
     };
 
-    let content = column![chrome_row(), body]
+    // A safety net, not the primary layout: the controls/wizard body should
+    // fit in the window on its own, but if a banner, wrapped alert copy, or a
+    // long device name ever pushes it past the fold, this guarantees every
+    // control (including Cancel/Finish) stays reachable instead of clipping.
+    // The chrome row lives outside this scrollable so the window stays
+    // movable/closable no matter how tall the body gets.
+    let scrollable_body = scrollable(body)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .direction(scrollable::Direction::Vertical(
+            scrollable::Scrollbar::new().width(4.0).margin(2.0).scroller_width(4.0),
+        ))
+        .style(scrollbar_style);
+
+    let content = column![chrome_row(), scrollable_body]
         .spacing(16)
         .width(Length::Fill)
         .height(Length::Fill);
@@ -130,16 +146,23 @@ fn banner_row(app: &App) -> Option<Element<'_, Message>> {
         ),
     };
 
-    let content = row![
+    // The message sits alone on its own row so it always gets the banner's
+    // full width to wrap into (never starved by the buttons' widths); the
+    // actions sit right-aligned on their own row below it.
+    let content = column![
         text(message).font(FONT_REGULAR).size(12).color(TEXT).width(Length::Fill),
-        button(text(action_label).font(FONT_SEMIBOLD).size(12))
-            .padding([4.0, 10.0])
-            .style(banner_action_style)
-            .on_press(action),
-        button(text("✕").size(12)).padding([2.0, 8.0]).style(close_button_style).on_press(dismiss),
+        row![
+            space::horizontal(),
+            button(text(action_label).font(FONT_SEMIBOLD).size(12))
+                .padding([4.0, 10.0])
+                .style(banner_action_style)
+                .on_press(action),
+            button(text("✕").size(12)).padding([2.0, 8.0]).style(close_button_style).on_press(dismiss),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center),
     ]
-    .spacing(8)
-    .align_y(Alignment::Center);
+    .spacing(8);
 
     Some(
         container(content)
@@ -152,6 +175,24 @@ fn banner_row(app: &App) -> Option<Element<'_, Message>> {
             })
             .into(),
     )
+}
+
+/// Thin, unobtrusive scrollbar for the body's scrollable safety net: a
+/// surface-colored rail rather than the theme's default (primary-colored on
+/// hover), so it reads as incidental rather than a primary control.
+fn scrollbar_style(theme: &Theme, status: scrollable::Status) -> scrollable::Style {
+    let mut style = scrollable::default(theme, status);
+    let rail = scrollable::Rail {
+        background: None,
+        border: iced::border::rounded(2.0),
+        scroller: scrollable::Scroller {
+            background: SURFACE.into(),
+            border: iced::border::rounded(2.0),
+        },
+    };
+    style.vertical_rail = rail;
+    style.horizontal_rail = rail;
+    style
 }
 
 fn banner_action_style(_theme: &Theme, status: button::Status) -> button::Style {
@@ -224,7 +265,7 @@ fn status_line(app: &App) -> Element<'_, Message> {
             TrayState::Loud => ("Too loud", RED),
         }
     };
-    text(label).font(FONT_SEMIBOLD).size(20).color(color).into()
+    text(label).font(FONT_SEMIBOLD).size(20).color(color).width(Length::Fill).into()
 }
 
 fn alerts_line(app: &App) -> Element<'_, Message> {
@@ -232,6 +273,7 @@ fn alerts_line(app: &App) -> Element<'_, Message> {
         .font(FONT_REGULAR)
         .size(13)
         .color(TEXT_MUTED)
+        .width(Length::Fill)
         .into()
 }
 
@@ -332,10 +374,13 @@ fn test_mode_row(app: &App) -> Element<'_, Message> {
 }
 
 fn input_line(app: &App) -> Element<'_, Message> {
+    // The device name is arbitrary, driver-supplied text (easily 60+ chars);
+    // an explicit fill width lets it wrap across lines instead of clipping.
     text(format!("Input: {}", app.device_name))
         .font(FONT_REGULAR)
         .size(12)
         .color(TEXT_MUTED)
+        .width(Length::Fill)
         .into()
 }
 

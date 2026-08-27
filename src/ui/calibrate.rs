@@ -329,11 +329,15 @@ pub fn view<'a>(wizard: &Wizard, meter: Element<'a, Message>) -> Element<'a, Mes
     // Discard button in its own button row above: leaving a finished
     // calibration must be a deliberate choice, never the ambient row every
     // other step shows.
+    //
+    // This is deliberately Shrink-height (no trailing `space::vertical()`
+    // pinning Cancel to the window's bottom edge): the settings view wraps
+    // this whole body in a scrollable, which needs to measure the wizard's
+    // natural content height to know whether it overflows the window and
+    // needs to scroll. A Fill-height root would just clamp to the viewport
+    // and hide that overflow instead of exposing it.
     let is_done = matches!(wizard.step, WizardStep::Done { .. });
-    let mut root = column![content, space::vertical()]
-        .spacing(16)
-        .width(Length::Fill)
-        .height(Length::Fill);
+    let mut root = column![content].spacing(16).width(Length::Fill);
     if !is_done {
         root = root.push(cancel_row());
     }
@@ -341,11 +345,14 @@ pub fn view<'a>(wizard: &Wizard, meter: Element<'a, Message>) -> Element<'a, Mes
 }
 
 fn heading<'a>(label: impl Into<String>) -> Element<'a, Message> {
-    text(label.into()).font(FONT_SEMIBOLD).size(20).color(TEXT).into()
+    // 18pt (not the original 20pt) keeps two-line wraps of the longer step
+    // prompts (e.g. "Talk at the volume you'd use if they were in the
+    // room.") from eating too much vertical space.
+    text(label.into()).font(FONT_SEMIBOLD).size(18).color(TEXT).width(Length::Fill).into()
 }
 
 fn body_text<'a>(label: impl Into<String>) -> Element<'a, Message> {
-    text(label.into()).font(FONT_REGULAR).size(13).color(TEXT_MUTED).into()
+    text(label.into()).font(FONT_REGULAR).size(13).color(TEXT_MUTED).width(Length::Fill).into()
 }
 
 fn buttons<'a>(items: Vec<Element<'a, Message>>) -> Element<'a, Message> {

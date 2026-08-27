@@ -482,7 +482,7 @@ impl App {
             return Task::none();
         }
         let (_, open) = window::open(window::Settings {
-            size: iced::Size::new(380.0, 560.0),
+            size: iced::Size::new(400.0, 600.0),
             resizable: false,
             decorations: false,
             icon: Some(ui::icons::window_icon()),
