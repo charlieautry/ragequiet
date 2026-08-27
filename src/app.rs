@@ -316,9 +316,11 @@ impl App {
             Message::WindowClosed(id) => {
                 if self.settings_window == Some(id) {
                     self.settings_window = None;
-                    // The wizard lives in this window: closing it is a cancel,
-                    // otherwise a measurement would keep running headless.
-                    self.cancel_wizard();
+                    // The wizard lives in this window: closing it must not
+                    // silently discard a finished calibration (a completed
+                    // wizard is applied), and must not leave a measurement
+                    // running headless (any in-flight one is cancelled).
+                    self.teardown_wizard(true);
                 }
                 self.commit_config();
                 Task::none()
@@ -386,8 +388,10 @@ impl App {
             }
             Message::WizardStarted => {
                 // Restarting mid-run must not orphan a measurement in the
-                // audio callback.
-                self.cancel_wizard();
+                // audio callback, and must not silently apply a stale
+                // finished result either — restarting is the user choosing
+                // to redo it, not to keep what they had.
+                self.teardown_wizard(false);
                 self.wizard = Some(Wizard::new(local_hour()));
                 // Started from the tray with no window: the wizard has to be
                 // visible to be usable, so open one (no-op if already open).
@@ -407,7 +411,9 @@ impl App {
                 Task::none()
             }
             Message::WizardCancelled => {
-                self.cancel_wizard();
+                // The user chose to discard (Cancel row, or the Done step's
+                // explicit Discard button): a finished result is not applied.
+                self.teardown_wizard(false);
                 Task::none()
             }
             Message::WizardFinished => {
@@ -433,6 +439,9 @@ impl App {
                 Task::none()
             }
             Message::Quit => {
+                // Quit is an exit path like any other: it must not silently
+                // discard a finished calibration sitting on the Done screen.
+                self.teardown_wizard(true);
                 self.commit_config();
                 iced::exit()
             }
@@ -522,6 +531,23 @@ impl App {
         {
             let _ = self.commands.send(Command::CancelMeasurement);
         }
+    }
+
+    /// Leave the wizard on any exit path (window close, quit, an explicit
+    /// cancel/discard, or a restart). When `apply_if_done` is true and the
+    /// wizard had reached `Done`, the finished calibration is persisted
+    /// rather than thrown away — closing the window or quitting must never
+    /// silently discard a completed calibration. Explicit discard (the Done
+    /// screen's Discard button, the ordinary Cancel row, or a restart) always
+    /// passes false: the user chose to abandon it.
+    fn teardown_wizard(&mut self, apply_if_done: bool) {
+        if apply_if_done
+            && let Some(WizardStep::Done { result }) = self.wizard.as_ref().map(|w| &w.step)
+        {
+            let result = *result;
+            self.apply_calibration(result);
+        }
+        self.cancel_wizard();
     }
 
     /// Persist a finished calibration and make it live: config write, engine

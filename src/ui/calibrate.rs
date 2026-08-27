@@ -224,7 +224,7 @@ pub fn view<'a>(wizard: &Wizard, meter: Element<'a, Message>) -> Element<'a, Mes
         WizardStep::Intro => column![
             heading("Calibrate for this mic"),
             body_text(
-                "About 15 seconds: three seconds of silence, then two short voice \
+                "Takes under a minute: three seconds of silence, then two short voice \
                  samples. Ragequiet learns what quiet and loud sound like on this \
                  microphone so it only nudges you when you're actually too loud."
             ),
@@ -310,22 +310,34 @@ pub fn view<'a>(wizard: &Wizard, meter: Element<'a, Message>) -> Element<'a, Mes
                 None => "Loud point: estimated (skipped)".to_string(),
             };
             column![
-                heading("Calibration saved"),
+                heading("Calibration ready"),
                 body_text(format!("Quiet point: {:.0} dB", result.quiet_db)),
                 body_text(ceiling),
+                body_text("Finish to save and start using it."),
                 meter,
-                buttons(vec![primary("Finish", Message::WizardFinished)]),
+                buttons(vec![
+                    primary("Finish", Message::WizardFinished),
+                    secondary("Discard", Message::WizardCancelled),
+                ]),
             ]
             .spacing(16)
             .into()
         }
     };
 
-    column![content, space::vertical(), cancel_row()]
+    // The Done step swaps the always-present Cancel row for an explicit
+    // Discard button in its own button row above: leaving a finished
+    // calibration must be a deliberate choice, never the ambient row every
+    // other step shows.
+    let is_done = matches!(wizard.step, WizardStep::Done { .. });
+    let mut root = column![content, space::vertical()]
         .spacing(16)
         .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+        .height(Length::Fill);
+    if !is_done {
+        root = root.push(cancel_row());
+    }
+    root.into()
 }
 
 fn heading<'a>(label: impl Into<String>) -> Element<'a, Message> {
