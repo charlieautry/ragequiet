@@ -2,6 +2,8 @@
 
 mod alert;
 mod audio;
+#[allow(dead_code)] // used from the config wiring task on
+mod config;
 mod detector;
 mod engine;
 
