@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "1.0.104"
 cpal = "0.18.2"
 futures = "0.3.34"
-iced = { version = "0.14.0", features = ["canvas", "tokio"] }
+iced = { version = "0.14.0", default-features = false, features = ["canvas", "tokio", "tiny-skia"] }
 png = "0.18.1"
 realfft = "3.5.0"
 serde = { version = "1.0.229", features = ["derive"] }
