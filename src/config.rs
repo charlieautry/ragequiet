@@ -36,6 +36,17 @@ impl Default for Config {
     }
 }
 
+impl DeviceCalibration {
+    pub fn tuning(&self) -> crate::engine::Tuning {
+        crate::engine::Tuning {
+            noise_floor_db: self.noise_floor_db,
+            quiet_db: Some(self.quiet_db),
+            ceiling_db: self.ceiling_db,
+            sensitivity: self.sensitivity,
+        }
+    }
+}
+
 impl Config {
     pub fn path() -> Option<PathBuf> {
         std::env::var_os("APPDATA")
