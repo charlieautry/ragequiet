@@ -19,7 +19,15 @@ pub fn norm(db: f32) -> f32 {
 /// Level fill color: red at/over the threshold, yellow within 3 dB below it,
 /// green further under. The 3 dB "getting loud" band matches the engine's
 /// Quiet/Warning/Loud classification boundary.
+///
+/// A non-finite `threshold_db` (an uncalibrated device before its first calm
+/// voiced frame — `Engine::threshold_db()` returns NaN then) is treated as
+/// "no threshold yet": the level reads as green rather than propagating NaN
+/// into every comparison below.
 pub fn level_color(level_db: f32, threshold_db: f32) -> Color {
+    if !threshold_db.is_finite() {
+        return GREEN;
+    }
     if level_db >= threshold_db {
         RED
     } else if level_db >= threshold_db - 3.0 {
@@ -84,14 +92,19 @@ impl Meter {
         let background = canvas::Path::rounded_rectangle(Point::ORIGIN, size, border::radius(8.0));
         frame.fill(&background, SURFACE);
 
-        // 2. Red-shaded region past the threshold.
-        let threshold_x = (norm(self.threshold_db) * w).clamp(0.0, w);
-        if threshold_x < w {
-            frame.fill_rectangle(
-                Point::new(threshold_x, 0.0),
-                Size::new(w - threshold_x, h),
-                Color { a: 0.15, ..RED },
-            );
+        // 2. Red-shaded region past the threshold. Skipped entirely when the
+        // threshold isn't finite yet (uncalibrated device, no calm voiced
+        // frame observed) — `norm` clamps but doesn't cure NaN, and an
+        // unclamped NaN coordinate would otherwise reach the renderer.
+        if self.threshold_db.is_finite() {
+            let threshold_x = (norm(self.threshold_db) * w).clamp(0.0, w);
+            if threshold_x < w {
+                frame.fill_rectangle(
+                    Point::new(threshold_x, 0.0),
+                    Size::new(w - threshold_x, h),
+                    Color { a: 0.15, ..RED },
+                );
+            }
         }
 
         // 3. Current-level fill from the left, rounded on the left edge only,
@@ -120,14 +133,18 @@ impl Meter {
             draw_marker(frame, quiet_db, tick_y, tick_h, TICK_W, w, TEXT_MUTED);
         }
 
-        let peak_db = round_db(self.peak_db) as f32;
-        if peak_db > self.noise_floor_db {
+        let peak_db_rounded = round_db(self.peak_db);
+        if peak_db_rounded > round_db(self.noise_floor_db) {
+            let peak_db = peak_db_rounded as f32;
             let peak_color = level_color(peak_db, self.threshold_db);
             draw_marker(frame, peak_db, tick_y, tick_h, TICK_W, w, Color { a: 0.35, ..peak_color });
         }
 
-        // 5. Threshold: full-height line.
-        draw_marker(frame, self.threshold_db, 0.0, h, TICK_W, w, Color { a: 0.9, ..TEXT });
+        // 5. Threshold: full-height line. Skipped when not finite, same
+        // reasoning as the red region above.
+        if self.threshold_db.is_finite() {
+            draw_marker(frame, self.threshold_db, 0.0, h, TICK_W, w, Color { a: 0.9, ..TEXT });
+        }
 
         // 6. Ceiling: solid full-height line if confirmed, dashed (three
         // short segments — canvas has no native dashed-rect primitive) if
@@ -213,6 +230,37 @@ mod tests {
         assert_eq!(level_color(-29.0, -27.0), YELLOW); // within 3 dB below
         assert_eq!(level_color(-27.0, -27.0), RED);
         assert_eq!(level_color(-10.0, -27.0), RED);
+    }
+
+    #[test]
+    fn level_color_treats_non_finite_threshold_as_no_threshold() {
+        // An uncalibrated device before its first calm voiced frame reports
+        // threshold_db = NaN (Engine::threshold_db()); the meter must not
+        // let that propagate into a red/yellow reading.
+        assert_eq!(level_color(-40.0, f32::NAN), GREEN);
+        assert_eq!(level_color(0.0, f32::NAN), GREEN);
+        assert_eq!(level_color(-40.0, f32::INFINITY), GREEN);
+    }
+
+    #[test]
+    fn non_finite_threshold_is_representable_without_panic() {
+        // Regression test for the NaN-threshold case: computing the draw key
+        // and painting must not panic (paint() needs a renderer, so this
+        // exercises draw_key() plus the same is_finite() guards paint() uses
+        // directly, since a full Frame isn't constructible in a unit test).
+        let meter = Meter {
+            level_db: -40.0,
+            threshold_db: f32::NAN,
+            peak_db: -35.0,
+            noise_floor_db: -55.0,
+            quiet_db: None,
+            ceiling_db: None,
+            ceiling_confirmed: false,
+        };
+        let key = meter.draw_key();
+        // Rust's float-to-int cast saturates NaN to 0 rather than panicking.
+        assert_eq!(key.threshold_db, 0);
+        assert!(!meter.threshold_db.is_finite());
     }
 
     #[test]
