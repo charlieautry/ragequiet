@@ -45,6 +45,11 @@ impl AlertGate {
             Some(_) => false,
         }
     }
+
+    /// Forget any in-progress hold; keep the cooldown.
+    pub fn reset(&mut self) {
+        self.over_since = None;
+    }
 }
 
 use anyhow::Context;

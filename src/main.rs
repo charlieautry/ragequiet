@@ -2,33 +2,22 @@
 
 mod alert;
 mod audio;
+mod detector;
 mod engine;
 
-use alert::AlertGate;
 use cpal::traits::StreamTrait;
-use engine::{Engine, State};
+use detector::{Detector, GREEN, GREY};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tao::event::Event;
 use tao::event_loop::{ControlFlow, EventLoopBuilder};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIconBuilder};
 
-const GREEN: [u8; 3] = [46, 204, 113];
-const YELLOW: [u8; 3] = [241, 196, 15];
-const RED: [u8; 3] = [231, 76, 60];
-const GREY: [u8; 3] = [127, 140, 141];
-
 #[derive(Debug)]
 enum AppEvent {
     Color([u8; 3]),
     Menu(MenuEvent),
-}
-
-fn color_for(state: State) -> [u8; 3] {
-    match state {
-        State::Quiet | State::Calm { .. } => GREEN,
-        State::GettingLoud { .. } => YELLOW,
-        State::TooLoud { .. } => RED,
-    }
 }
 
 /// 32x32 filled circle in the given color; generated in code, no asset files.
@@ -71,23 +60,21 @@ fn main() -> anyhow::Result<()> {
         .with_icon(make_icon(GREEN))
         .build()?;
 
-    let mut eng = Engine::new();
-    let mut gate = AlertGate::new(300, 3000);
+    let mut detector = Detector::new();
     let start = std::time::Instant::now();
-    let mut last_color = GREEN;
+    let resume_flag = Arc::new(AtomicBool::new(false));
+    let callback_resume_flag = Arc::clone(&resume_flag);
     let audio_proxy = event_loop.create_proxy();
     let stream = audio::start_input(move |frame| {
-        let state = eng.process(frame);
-        if gate.update(
-            matches!(state, State::TooLoud { .. }),
-            start.elapsed().as_millis() as u64,
-        ) {
+        if callback_resume_flag.swap(false, Ordering::Relaxed) {
+            detector.resume();
+        }
+        let now_ms = start.elapsed().as_millis() as u64;
+        let outcome = detector.on_frame(frame, now_ms);
+        if outcome.beep {
             alert::play_beep();
         }
-        // notify the UI thread only on change, so idle costs nothing
-        let color = color_for(state);
-        if color != last_color {
-            last_color = color;
+        if let Some(color) = outcome.color_change {
             let _ = audio_proxy.send_event(AppEvent::Color(color));
         }
     })?;
@@ -109,6 +96,7 @@ fn main() -> anyhow::Result<()> {
                     } else if e.id() == enabled_item.id() {
                         enabled = enabled_item.is_checked();
                         if enabled {
+                            resume_flag.store(true, Ordering::Relaxed);
                             let _ = stream.play();
                             let _ = tray.set_icon(Some(make_icon(GREEN)));
                         } else {
