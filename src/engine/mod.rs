@@ -192,4 +192,47 @@ mod tests {
         }
         assert!(recovered, "engine never re-adapted to the new gain level");
     }
+
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
+    thread_local! {
+        static ALLOC_COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    struct CountingAlloc;
+
+    // SAFETY: delegates directly to System; the counter is thread-local
+    // and touched outside the allocator's own allocation path.
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOC_COUNT.with(|c| c.set(c.get() + 1));
+            unsafe { System.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static A: CountingAlloc = CountingAlloc;
+
+    #[test]
+    fn process_never_allocates() {
+        let mut e = Engine::new();
+        let quiet = quiet_voice();
+        let loud = loud_voice();
+        // warm up outside the measured window
+        for _ in 0..50 {
+            e.process(&quiet);
+        }
+        let before = ALLOC_COUNT.with(|c| c.get());
+        for _ in 0..200 {
+            e.process(&quiet);
+            e.process(&loud);
+            e.process(&[0.0; FRAME_SIZE]);
+        }
+        let after = ALLOC_COUNT.with(|c| c.get());
+        assert_eq!(after - before, 0, "hot path allocated {} times", after - before);
+    }
 }

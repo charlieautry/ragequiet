@@ -43,6 +43,7 @@ pub struct Spectrum {
     fft: Arc<dyn RealToComplex<f32>>,
     input: Vec<f32>,
     output: Vec<Complex<f32>>,
+    scratch: Vec<Complex<f32>>,
     power: Vec<f32>,
     bin_hz: f32,
 }
@@ -52,14 +53,17 @@ impl Spectrum {
         let fft = RealFftPlanner::<f32>::new().plan_fft_forward(size);
         let input = fft.make_input_vec();
         let output = fft.make_output_vec();
+        let scratch = fft.make_scratch_vec();
         let power = vec![0.0; output.len()];
-        Self { fft, input, output, power, bin_hz: sample_rate / size as f32 }
+        Self { fft, input, output, scratch, power, bin_hz: sample_rate / size as f32 }
     }
 
     pub fn analyze(&mut self, frame: &[f32]) -> SpectralFeatures {
         self.input.copy_from_slice(frame);
-        // process() cannot fail when buffer sizes come from the plan itself
-        let _ = self.fft.process(&mut self.input, &mut self.output);
+        // process_with_scratch() cannot fail when buffer sizes come from the plan itself
+        let _ = self
+            .fft
+            .process_with_scratch(&mut self.input, &mut self.output, &mut self.scratch);
         for (p, c) in self.power.iter_mut().zip(&self.output) {
             *p = c.norm_sqr();
         }
