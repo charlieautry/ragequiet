@@ -402,6 +402,9 @@ fn cooldown_block(app: &App) -> Element<'_, Message> {
 /// the file dialog; a chosen custom file's name becomes the closed control's
 /// display text (see `SoundChoice`/`App::sound_choice`). A **Test** button
 /// alongside it plays the current selection through the configured device.
+/// Two independent inline errors can show below it: `sound_error` (the
+/// configured file failed to decode) and `output_error` (the output device
+/// failed to open — polled from the player worker; see `App::output_error`).
 fn alert_sound_block(app: &App) -> Element<'_, Message> {
     let options: Vec<SoundChoice> = sounds::ALL
         .iter()
@@ -426,6 +429,10 @@ fn alert_sound_block(app: &App) -> Element<'_, Message> {
     .spacing(6);
 
     if let Some(error) = &app.sound_error {
+        block = block.push(text(error).font(FONT_REGULAR).size(12).color(RED));
+    }
+
+    if let Some(error) = &app.output_error {
         block = block.push(text(error).font(FONT_REGULAR).size(12).color(RED));
     }
 

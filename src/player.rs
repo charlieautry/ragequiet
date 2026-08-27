@@ -31,9 +31,16 @@ pub struct PlayRequest {
 }
 
 /// Handle to the player's worker thread. Cheap to clone-by-reference (the
-/// sender is the only field); `App` owns one.
+/// sender and the shared error slot are the only fields); `App` owns one.
 pub struct Player {
     tx: mpsc::Sender<PlayRequest>,
+    /// The worker's last open/build failure, if the most recent attempt
+    /// failed; `None` once a subsequent open succeeds. This is the
+    /// user-facing channel for device errors — `windows_subsystem` builds
+    /// have no console for the worker's `eprintln!` to reach, so the
+    /// settings window is the only place a Test-button failure (or a boot-
+    /// time device loss) is ever visible.
+    error: Arc<Mutex<Option<String>>>,
 }
 
 impl Player {
@@ -42,8 +49,10 @@ impl Player {
     /// first `play()` call.
     pub fn spawn() -> Player {
         let (tx, rx) = mpsc::channel::<PlayRequest>();
-        std::thread::spawn(move || worker_loop(rx));
-        Player { tx }
+        let error = Arc::new(Mutex::new(None));
+        let worker_error = Arc::clone(&error);
+        std::thread::spawn(move || worker_loop(rx, worker_error));
+        Player { tx, error }
     }
 
     /// Non-blocking: hands the request to the worker thread. Safe to call
@@ -51,6 +60,13 @@ impl Player {
     /// somehow died (it shouldn't).
     pub fn play(&self, req: PlayRequest) {
         let _ = self.tx.send(req);
+    }
+
+    /// The worker's current error, if any (lock, clone, return). Polled by
+    /// the UI on `Tick`/`WindowOpened` rather than pushed, since the worker
+    /// thread has no direct line back into the iced update loop.
+    pub fn last_error(&self) -> Option<String> {
+        self.error.lock().ok().and_then(|guard| guard.clone())
     }
 }
 
@@ -122,8 +138,8 @@ fn mix_sample(sample: f32, volume: f32) -> f32 {
     (sample * volume.clamp(0.0, 1.0)).clamp(-1.0, 1.0)
 }
 
-fn worker_loop(rx: mpsc::Receiver<PlayRequest>) {
-    let mut worker = Worker::new();
+fn worker_loop(rx: mpsc::Receiver<PlayRequest>, error: Arc<Mutex<Option<String>>>) {
+    let mut worker = Worker::new(error);
     loop {
         match rx.recv_timeout(IDLE_TIMEOUT) {
             Ok(req) => worker.handle(req),
@@ -145,16 +161,21 @@ struct Worker {
     /// Dedup gate: log a build/resolve failure once, not every request,
     /// until a subsequent open succeeds.
     error_logged: bool,
+    /// Shared with `Player`: set with a short human message on an open/build
+    /// failure, cleared on the next successful open. This is the user-facing
+    /// counterpart to `error_logged`'s debug-build `eprintln!`.
+    error: Arc<Mutex<Option<String>>>,
 }
 
 impl Worker {
-    fn new() -> Self {
+    fn new(error: Arc<Mutex<Option<String>>>) -> Self {
         Self {
             stream: None,
             open_for: None,
             out_rate: 0,
             playback: Arc::new(Mutex::new(Playback::silent())),
             error_logged: false,
+            error,
         }
     }
 
@@ -167,11 +188,17 @@ impl Worker {
                     self.open_for = req.device_name.clone();
                     self.out_rate = out_rate;
                     self.error_logged = false;
+                    if let Ok(mut slot) = self.error.lock() {
+                        *slot = None;
+                    }
                 }
                 Err(e) => {
                     if !self.error_logged {
                         eprintln!("alert playback failed: {e}");
                         self.error_logged = true;
+                    }
+                    if let Ok(mut slot) = self.error.lock() {
+                        *slot = Some("Couldn't open the output device".to_string());
                     }
                     self.stream = None;
                     self.open_for = None;
@@ -396,5 +423,24 @@ mod tests {
         let mut pb = Playback::silent();
         assert_eq!(pb.next_sample(), 0.0);
         assert!(!pb.active);
+    }
+
+    /// Pins the shared error slot's setter/getter contract that `Player`
+    /// and `Worker` communicate through, independent of a real cpal
+    /// device: starts empty, reflects a set failure, and clears again —
+    /// the same sequence a real open/build failure followed by a
+    /// successful reopen drives.
+    #[test]
+    fn shared_error_state_reads_back_what_was_set_and_clears() {
+        let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let read = || error.lock().ok().and_then(|guard| guard.clone());
+
+        assert_eq!(read(), None);
+
+        *error.lock().unwrap() = Some("Couldn't open the output device".to_string());
+        assert_eq!(read(), Some("Couldn't open the output device".to_string()));
+
+        *error.lock().unwrap() = None;
+        assert_eq!(read(), None);
     }
 }

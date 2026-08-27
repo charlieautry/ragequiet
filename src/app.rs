@@ -181,6 +181,14 @@ pub struct App {
     /// opens (never per-frame/per-Tick). "System default" is prepended in
     /// the view, not stored here.
     pub(crate) output_devices: Vec<String>,
+    /// The player worker's last open/build failure, polled from
+    /// `player.last_error()` on every `Tick` (and once on `WindowOpened` so a
+    /// pre-existing failure shows immediately instead of waiting for the
+    /// first tick). `windows_subsystem` builds have no console for the
+    /// worker's own `eprintln!` to reach, so this is the only user-visible
+    /// surface for an alert-output failure (e.g. the Test button going
+    /// silent). Mirrors `sound_error`'s inline-error idiom.
+    pub(crate) output_error: Option<String>,
     /// Whether launch-at-login is currently on, per the registry (the
     /// runtime source of truth — see `crate::autostart`). Refreshed from
     /// `autostart::autostart_enabled()` at boot and on every `WindowOpened`,
@@ -419,6 +427,7 @@ impl App {
                 custom_sound_rate,
                 sound_error,
                 output_devices: Vec::new(),
+                output_error: None,
                 autostart: autostart::autostart_enabled(),
                 autostart_error: None,
                 wizard_error: None,
@@ -488,6 +497,10 @@ impl App {
                 // (e.g. hand-edited via regedit) is reflected rather than
                 // trusting a possibly-stale cached value.
                 self.autostart = autostart::autostart_enabled();
+                // A device failure from before the window ever opened (e.g.
+                // the configured output device was unplugged at boot) must
+                // show immediately rather than waiting for the first Tick.
+                self.output_error = self.player.last_error();
                 round_corners(id)
             }
             Message::WindowClosed(id) => {
@@ -506,6 +519,10 @@ impl App {
                 self.latest = self.shared.load();
                 self.today = local_date();
                 self.hour = local_hour();
+                // The window is only open while Tick fires, so this costs
+                // nothing while parked in the tray; picks up a Test-button
+                // failure (or the worker recovering) within one tick.
+                self.output_error = self.player.last_error();
 
                 // Voiced-measurement stall detection: a `Progress` event
                 // resets `measure_progress_seen`/`measure_stalled_ticks`
