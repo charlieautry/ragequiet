@@ -1,8 +1,156 @@
-pub mod features;
-#[allow(dead_code)] // used from Task 7 on
 pub mod baseline;
-#[allow(dead_code)] // used from Task 7 on
+pub mod features;
 pub mod vad;
+
+use baseline::RollingMedian;
+use features::{db_from_rms, rms, zero_crossing_rate, Spectrum};
 
 pub const FRAME_SIZE: usize = 512;
 pub const SAMPLE_RATE: u32 = 16_000;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum State {
+    /// Below the noise gate, or not voice.
+    Quiet,
+    /// Voice, comfortably under the threshold.
+    Calm { db: f32 },
+    /// Voice within 3 dB below the threshold.
+    GettingLoud { db: f32 },
+    /// Voice over the threshold, and spectrally bright (both must agree).
+    TooLoud { db: f32 },
+}
+
+/// Pure DSP cascade: energy gate -> VAD -> level vs baseline + tilt.
+/// No allocation, no I/O, no locks. Calibration later replaces the
+/// hardcoded noise floor / margin with per-device profiles.
+pub struct Engine {
+    spectrum: Spectrum,
+    level_baseline: RollingMedian,
+    tilt_baseline: RollingMedian,
+    noise_floor_db: f32,
+    margin_db: f32,
+}
+
+impl Engine {
+    pub fn new() -> Self {
+        Self {
+            spectrum: Spectrum::new(FRAME_SIZE, SAMPLE_RATE as f32),
+            // ~600 voiced frames = a few minutes of actual talking
+            level_baseline: RollingMedian::new(600),
+            tilt_baseline: RollingMedian::new(600),
+            noise_floor_db: -55.0,
+            margin_db: 7.0,
+        }
+    }
+
+    pub fn process(&mut self, frame: &[f32]) -> State {
+        let db = db_from_rms(rms(frame));
+        if db < self.noise_floor_db + 3.0 {
+            return State::Quiet;
+        }
+        let zcr = zero_crossing_rate(frame);
+        let feat = self.spectrum.analyze(frame);
+        if !vad::is_voiced(zcr, &feat) {
+            return State::Quiet;
+        }
+
+        let threshold = self.level_baseline.median().unwrap_or(db) + self.margin_db;
+        let tilt_ref = self.tilt_baseline.median().unwrap_or(feat.tilt_db);
+        // Only calm frames feed the baselines, so a long shout can't raise the threshold.
+        if db < threshold - 3.0 {
+            self.level_baseline.push(db);
+            self.tilt_baseline.push(feat.tilt_db);
+        }
+
+        let bright = feat.tilt_db > tilt_ref + 3.0;
+        if db >= threshold && bright {
+            State::TooLoud { db }
+        } else if db >= threshold - 3.0 {
+            State::GettingLoud { db }
+        } else {
+            State::Calm { db }
+        }
+    }
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mix(rate: f32, n: usize, parts: &[(f32, f32)]) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                parts
+                    .iter()
+                    .map(|&(freq, amp)| (i as f32 / rate * freq * std::f32::consts::TAU).sin() * amp)
+                    .sum()
+            })
+            .collect()
+    }
+
+    // Calm speech proxy: strong 200 Hz, faint 1.5 kHz -> ~-37 dB, dark tilt.
+    fn quiet_voice() -> Vec<f32> {
+        mix(16000.0, FRAME_SIZE, &[(200.0, 0.02), (1500.0, 0.004)])
+    }
+
+    // Raised speech proxy: much louder AND brighter (stronger high band).
+    fn loud_voice() -> Vec<f32> {
+        mix(16000.0, FRAME_SIZE, &[(200.0, 0.3), (2000.0, 0.15)])
+    }
+
+    #[test]
+    fn silence_is_quiet() {
+        let mut e = Engine::new();
+        assert_eq!(e.process(&vec![0.0; FRAME_SIZE]), State::Quiet);
+    }
+
+    #[test]
+    fn quiet_voice_is_calm_after_warmup() {
+        let mut e = Engine::new();
+        let frame = quiet_voice();
+        let mut last = State::Quiet;
+        for _ in 0..50 {
+            last = e.process(&frame);
+        }
+        assert!(matches!(last, State::Calm { .. }), "got {last:?}");
+    }
+
+    #[test]
+    fn loud_bright_voice_over_calm_baseline_is_too_loud() {
+        let mut e = Engine::new();
+        let quiet = quiet_voice();
+        for _ in 0..50 {
+            e.process(&quiet);
+        }
+        let state = e.process(&loud_voice());
+        assert!(matches!(state, State::TooLoud { .. }), "got {state:?}");
+    }
+
+    #[test]
+    fn shouting_does_not_drag_the_baseline_up() {
+        let mut e = Engine::new();
+        let quiet = quiet_voice();
+        let loud = loud_voice();
+        for _ in 0..50 {
+            e.process(&quiet);
+        }
+        for _ in 0..200 {
+            e.process(&loud);
+        }
+        // still flagged loud after 200 loud frames (~6.4 s)
+        assert!(matches!(e.process(&loud), State::TooLoud { .. }));
+    }
+
+    #[test]
+    fn below_noise_floor_is_quiet_even_if_periodic() {
+        let mut e = Engine::new();
+        let faint = mix(16000.0, FRAME_SIZE, &[(200.0, 0.0005)]); // ~-69 dB
+        assert_eq!(e.process(&faint), State::Quiet);
+    }
+}

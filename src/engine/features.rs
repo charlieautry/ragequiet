@@ -19,7 +19,6 @@ pub fn db_from_rms(rms: f32) -> f32 {
     20.0 * rms.log10()
 }
 
-#[allow(dead_code)] // used from Task 7 on
 pub fn zero_crossing_rate(frame: &[f32]) -> f32 {
     if frame.len() < 2 {
         return 0.0;
@@ -31,7 +30,6 @@ pub fn zero_crossing_rate(frame: &[f32]) -> f32 {
     crossings as f32 / (frame.len() - 1) as f32
 }
 
-#[allow(dead_code)] // used from Task 7 on
 #[derive(Debug, Clone, Copy)]
 pub struct SpectralFeatures {
     /// 10*log10(energy 1-4 kHz / energy 100-500 Hz). Raised voice is brighter.
@@ -41,7 +39,6 @@ pub struct SpectralFeatures {
 }
 
 /// 512-point real FFT with preallocated buffers; analyze() never allocates.
-#[allow(dead_code)] // used from Task 7 on
 pub struct Spectrum {
     fft: Arc<dyn RealToComplex<f32>>,
     input: Vec<f32>,
@@ -50,7 +47,6 @@ pub struct Spectrum {
     bin_hz: f32,
 }
 
-#[allow(dead_code)] // used from Task 7 on
 impl Spectrum {
     pub fn new(size: usize, sample_rate: f32) -> Self {
         let fft = RealFftPlanner::<f32>::new().plan_fft_forward(size);

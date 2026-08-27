@@ -2,15 +2,20 @@ mod audio;
 mod engine;
 
 use cpal::traits::StreamTrait;
-use engine::features;
+use engine::{Engine, State};
 
 fn main() -> anyhow::Result<()> {
-    let stream = audio::start_input(|frame| {
-        let db = features::db_from_rms(features::rms(frame));
-        println!("{db:7.1} dB");
+    let mut eng = Engine::new();
+    let stream = audio::start_input(move |frame| {
+        match eng.process(frame) {
+            State::Quiet => {}
+            State::Calm { db } => println!("  calm {db:6.1} dB"),
+            State::GettingLoud { db } => println!("  getting loud {db:6.1} dB"),
+            State::TooLoud { db } => println!("LOUD {db:6.1} dB"),
+        }
     })?;
     stream.play()?;
-    println!("listening on default input — Ctrl+C to quit");
+    println!("listening — talk normally for ~30 s to build a baseline, then raise your voice");
     std::thread::park();
     Ok(())
 }
