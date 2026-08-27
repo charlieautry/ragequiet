@@ -1,8 +1,9 @@
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cpal::traits::StreamTrait;
+use cpal::traits::{HostTrait, StreamTrait};
 use futures::SinkExt;
 use iced::widget::column;
 use iced::{window, Element, Subscription, Task, Theme};
@@ -12,7 +13,8 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 use crate::alert::AlertGate;
 use crate::audio;
 use crate::bridge::{self, Command, CommandTx, SharedLevels};
-use crate::config::{CalibrationState, Config, DeviceCalibration};
+use crate::config::{AlertSound, CalibrationState, Config, DeviceCalibration};
+use crate::decode;
 use crate::detector::{Detector, MeasurementUpdate, TrayState};
 use crate::engine::Engine;
 use crate::player::{PlayRequest, Player};
@@ -69,6 +71,40 @@ impl SoundCache {
             .map(|(_, samples)| Arc::clone(samples))
             .expect("SoundCache::render_all covers every BuiltinSound")
     }
+}
+
+/// One entry in the settings window's "Alert sound" `pick_list`: the six
+/// built-ins plus a "Custom…" entry that (when picked) opens the file
+/// dialog rather than selecting a sound directly. `Custom(Some(name))` is
+/// never an option in the list itself — it only ever appears as the picker's
+/// *current selection* once a custom file is active, so the closed control
+/// shows the file's name instead of the literal "Custom…" placeholder text
+/// (`pick_list` renders `selected.to_string()` independently of whether it
+/// matches one of the listed options).
+#[derive(Debug, Clone, PartialEq)]
+pub enum SoundChoice {
+    Builtin(BuiltinSound),
+    Custom(Option<String>),
+}
+
+impl std::fmt::Display for SoundChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SoundChoice::Builtin(b) => write!(f, "{}", b.label()),
+            SoundChoice::Custom(None) => write!(f, "Custom…"),
+            SoundChoice::Custom(Some(name)) => write!(f, "{name}"),
+        }
+    }
+}
+
+/// The base filename of a custom sound's stored path, for display in the
+/// picker's closed state (the full path is often too long for the control).
+fn custom_sound_display_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .map(|f| f.to_string())
+        .unwrap_or_else(|| path.to_string())
 }
 
 /// Static markers the meter draws behind the live level, snapshotted from the
@@ -128,6 +164,21 @@ pub struct App {
     /// Owns the alert output stream's lifecycle on its own thread; `Beeped`
     /// hands it play requests and never blocks.
     player: Player,
+    /// The decoded custom alert file (mono f32 at its native rate) when
+    /// `config.alert_sound` is `Custom` and decoding succeeded; `None` means
+    /// `current_sound` falls back to the soft beep (no custom sound
+    /// configured, or the last decode attempt failed).
+    custom_sound: Option<Arc<Vec<f32>>>,
+    /// Native sample rate of `custom_sound`; meaningless while it's `None`.
+    custom_sound_rate: u32,
+    /// Inline settings-UI error from the most recent failed custom-sound
+    /// decode (boot-time load, or a freshly picked file); cleared on the next
+    /// successful decode.
+    pub(crate) sound_error: Option<String>,
+    /// Output device names, enumerated once each time the settings window
+    /// opens (never per-frame/per-Tick). "System default" is prepended in
+    /// the view, not stored here.
+    pub(crate) output_devices: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +219,21 @@ pub enum Message {
     BannerDismissed,
     /// Dismiss the drift-staleness nudge for this session only.
     DriftNudgeDismissed,
+    /// The alert-sound `pick_list` changed: either a built-in was chosen
+    /// directly, or the "Custom…" entry was picked (which itself triggers
+    /// `PickCustomSound` rather than changing the sound right away).
+    AlertSoundPicked(SoundChoice),
+    /// Open the native file dialog for choosing a custom alert sound.
+    PickCustomSound,
+    /// The file dialog resolved; `None` means the user cancelled it.
+    CustomSoundChosen(Option<PathBuf>),
+    /// Alert volume slider drag; persisted on release like hold/cooldown.
+    AlertVolumeChanged(f32),
+    /// Output device `pick_list` changed; `None` selects the system default.
+    OutputDevicePicked(Option<String>),
+    /// The settings window's Test button: plays the configured sound at the
+    /// configured volume/device, independent of the detector.
+    TestSound,
     Quit,
 }
 
@@ -257,6 +323,18 @@ impl App {
         let sounds = SoundCache::render_all();
         let player = Player::spawn();
 
+        // A configured custom sound is decoded once, up front, so `Beeped`
+        // never blocks on file IO: `current_sound` just clones the cached
+        // Arc. A failed decode falls back to the soft beep and remembers an
+        // inline error for the settings window rather than failing boot.
+        let (custom_sound, custom_sound_rate, sound_error) = match &config.alert_sound {
+            AlertSound::Custom { path } => match decode::decode_file(Path::new(path)) {
+                Ok((samples, rate)) => (Some(Arc::new(samples)), rate, None),
+                Err(e) => (None, sounds::SOUND_RATE, Some(format!("Could not load {path}: {e}"))),
+            },
+            AlertSound::Builtin(_) => (None, sounds::SOUND_RATE, None),
+        };
+
         let icons = TrayIconSets::load();
         let initial_icon_set = if calibration_incomplete { &icons.dotted } else { &icons.plain };
         // No stream means nothing is being monitored: say so with the off icon.
@@ -298,6 +376,10 @@ impl App {
                 drift_nudge_dismissed: false,
                 sounds,
                 player,
+                custom_sound,
+                custom_sound_rate,
+                sound_error,
+                output_devices: Vec::new(),
             },
             Task::none(), // no window at launch: the app lives in the tray
         )
@@ -334,13 +416,12 @@ impl App {
             }
             Message::Beeped => {
                 self.alerts_this_session += 1;
-                // Hardcoded selection for now; Task 3 wires this to config
-                // (alert_sound/alert_volume/output_device).
+                let (samples, source_rate) = self.current_sound();
                 self.player.play(PlayRequest {
-                    samples: self.sounds.get(BuiltinSound::SoftBeep),
-                    source_rate: sounds::SOUND_RATE,
-                    volume: 0.8,
-                    device_name: None,
+                    samples,
+                    source_rate,
+                    volume: self.config.effective_volume(),
+                    device_name: self.config.output_device.clone(),
                 });
                 Task::none()
             }
@@ -352,6 +433,7 @@ impl App {
                 self.latest = self.shared.load();
                 self.today = local_date();
                 self.hour = local_hour();
+                self.output_devices = enumerate_output_devices();
                 round_corners(id)
             }
             Message::WindowClosed(id) => {
@@ -482,6 +564,71 @@ impl App {
             }
             Message::DriftNudgeDismissed => {
                 self.drift_nudge_dismissed = true;
+                Task::none()
+            }
+            Message::AlertSoundPicked(choice) => {
+                match choice {
+                    SoundChoice::Builtin(b) => {
+                        self.config.alert_sound = AlertSound::Builtin(b);
+                        self.config_dirty = true;
+                        self.commit_config();
+                        Task::none()
+                    }
+                    // Picking "Custom…" itself doesn't select a sound: it
+                    // opens the file dialog, which only commits a change on
+                    // a successful pick + decode (`CustomSoundChosen`).
+                    SoundChoice::Custom(_) => Task::done(Message::PickCustomSound),
+                }
+            }
+            Message::PickCustomSound => {
+                // `pick_file()` must be called here, synchronously on the UI
+                // thread, to spawn the native dialog; the returned future
+                // (awaited by `Task::perform` on iced's executor) is what
+                // resolves once the user closes it.
+                let dialog = rfd::AsyncFileDialog::new().add_filter("Audio", &["wav", "mp3"]).pick_file();
+                Task::perform(dialog, |handle| {
+                    Message::CustomSoundChosen(handle.map(|h| h.path().to_path_buf()))
+                })
+            }
+            Message::CustomSoundChosen(Some(path)) => {
+                match decode::decode_file(&path) {
+                    Ok((samples, rate)) => {
+                        self.custom_sound = Some(Arc::new(samples));
+                        self.custom_sound_rate = rate;
+                        self.sound_error = None;
+                        self.config.alert_sound = AlertSound::Custom { path: path.to_string_lossy().into_owned() };
+                        self.config_dirty = true;
+                        self.commit_config();
+                    }
+                    Err(e) => {
+                        // Keep whatever sound was already configured/playing;
+                        // only the inline error line changes.
+                        self.sound_error = Some(format!("Could not load {}: {e}", path.display()));
+                    }
+                }
+                Task::none()
+            }
+            // The dialog was cancelled: nothing changes.
+            Message::CustomSoundChosen(None) => Task::none(),
+            Message::AlertVolumeChanged(value) => {
+                self.config.alert_volume = value;
+                self.config_dirty = true;
+                Task::none()
+            }
+            Message::OutputDevicePicked(device) => {
+                self.config.output_device = device;
+                self.config_dirty = true;
+                self.commit_config();
+                Task::none()
+            }
+            Message::TestSound => {
+                let (samples, source_rate) = self.current_sound();
+                self.player.play(PlayRequest {
+                    samples,
+                    source_rate,
+                    volume: self.config.effective_volume(),
+                    device_name: self.config.output_device.clone(),
+                });
                 Task::none()
             }
             Message::Quit => {
@@ -653,6 +800,33 @@ impl App {
         self.stream.is_some()
     }
 
+    /// Resolves the currently configured alert sound to samples + rate for a
+    /// `PlayRequest`: the built-in cache for `AlertSound::Builtin`, or the
+    /// decoded custom buffer for `AlertSound::Custom` — falling back to the
+    /// soft beep whenever a custom sound is configured but hasn't (or
+    /// couldn't) decode (`custom_sound` is `None`), so a beep never goes
+    /// silent just because a file went missing.
+    pub(crate) fn current_sound(&self) -> (Arc<Vec<f32>>, u32) {
+        match &self.config.alert_sound {
+            AlertSound::Builtin(b) => (self.sounds.get(*b), sounds::SOUND_RATE),
+            AlertSound::Custom { .. } => match &self.custom_sound {
+                Some(samples) => (Arc::clone(samples), self.custom_sound_rate),
+                None => (self.sounds.get(BuiltinSound::SoftBeep), sounds::SOUND_RATE),
+            },
+        }
+    }
+
+    /// The `SoundChoice` the alert-sound `pick_list` should show as selected:
+    /// the matching builtin, or (for a custom sound) its file's display name
+    /// — never `Custom(None)`, which only appears as the "Custom…" option
+    /// itself.
+    pub(crate) fn sound_choice(&self) -> SoundChoice {
+        match &self.config.alert_sound {
+            AlertSound::Builtin(b) => SoundChoice::Builtin(*b),
+            AlertSound::Custom { path } => SoundChoice::Custom(Some(custom_sound_display_name(path))),
+        }
+    }
+
     /// Writes `config` to disk exactly once per dirty edit, regardless of
     /// which of the three commit points (slider release, window close, quit)
     /// triggers it — covers slider edits made without a drag gesture (Ctrl+
@@ -710,6 +884,17 @@ fn calibration_incomplete_for(config: &Config, device_name: &str) -> bool {
             entry.state == CalibrationState::BaselineOnly || entry.tuning().quiet_db.is_none()
         }
     }
+}
+
+/// Output device names, for the settings window's "Output device" picker.
+/// Enumerated fresh each time the window opens (see `Message::WindowOpened`)
+/// rather than cached for the app's lifetime, so a device plugged in after
+/// launch still shows up without a restart; never called per-frame.
+fn enumerate_output_devices() -> Vec<String> {
+    cpal::default_host()
+        .output_devices()
+        .map(|devices| devices.map(|d| d.to_string()).collect())
+        .unwrap_or_default()
 }
 
 /// Whether the once-per-day calibration-incomplete banner should be visible.
@@ -1006,6 +1191,26 @@ mod tests {
             },
         );
         assert!(calibration_incomplete_for(&config, "Mic"));
+    }
+
+    #[test]
+    fn custom_sound_display_name_strips_the_directory() {
+        assert_eq!(custom_sound_display_name("C:/Users/me/Sounds/ding.wav"), "ding.wav");
+        assert_eq!(custom_sound_display_name(r"C:\Users\me\Sounds\ding.wav"), "ding.wav");
+    }
+
+    #[test]
+    fn custom_sound_display_name_falls_back_to_the_whole_path_when_unparseable() {
+        // A bare trailing separator has no file_name component; the whole
+        // string is a safer fallback than an empty label.
+        assert_eq!(custom_sound_display_name("C:/"), "C:/");
+    }
+
+    #[test]
+    fn sound_choice_display_matches_label_or_custom_text() {
+        assert_eq!(SoundChoice::Builtin(BuiltinSound::Chime).to_string(), "Chime");
+        assert_eq!(SoundChoice::Custom(None).to_string(), "Custom…");
+        assert_eq!(SoundChoice::Custom(Some("ding.wav".to_string())).to_string(), "ding.wav");
     }
 
     #[test]

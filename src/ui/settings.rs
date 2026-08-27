@@ -4,14 +4,19 @@
 //! here; Task 4 mounts the real canvas.
 
 use iced::widget::{
-    button, canvas, column, container, mouse_area, row, scrollable, slider, space, text, toggler,
+    button, canvas, column, container, mouse_area, pick_list, row, scrollable, slider, space, text, toggler,
 };
 use iced::{Alignment, Element, Length, Theme};
 
-use crate::app::{banner_visible, drift_nudge_visible, meta_threshold_db, App, Message};
+use crate::app::{banner_visible, drift_nudge_visible, meta_threshold_db, App, Message, SoundChoice};
 use crate::detector::TrayState;
+use crate::sounds;
 use crate::ui::meter::Meter;
 use crate::ui::theme::{BACKGROUND, FONT_REGULAR, FONT_SEMIBOLD, GREEN, RED, SURFACE, TEXT, TEXT_MUTED, YELLOW};
+
+/// "System default" is the picker's sentinel text for `output_device: None`;
+/// no real cpal device is expected to collide with this label.
+const SYSTEM_DEFAULT_DEVICE: &str = "System default";
 
 /// Which reminder banner (if any) should show. Only one shows at a time: the
 /// calibration-incomplete banner wins over the drift nudge whenever both
@@ -61,6 +66,9 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 .push(sensitivity_block(app))
                 .push(hold_block(app))
                 .push(cooldown_block(app))
+                .push(alert_sound_block(app))
+                .push(alert_volume_block(app))
+                .push(output_device_block(app))
                 .push(test_mode_row(app))
                 .push(input_line(app))
                 .into()
@@ -363,6 +371,73 @@ fn cooldown_block(app: &App) -> Element<'_, Message> {
     .step(1.0f32)
     .on_release(Message::SettingsCommitted);
     column![header, control].spacing(6).into()
+}
+
+/// "Alert sound" picker: the six built-ins plus a "Custom…" entry that opens
+/// the file dialog; a chosen custom file's name becomes the closed control's
+/// display text (see `SoundChoice`/`App::sound_choice`). A **Test** button
+/// alongside it plays the current selection through the configured device.
+fn alert_sound_block(app: &App) -> Element<'_, Message> {
+    let options: Vec<SoundChoice> = sounds::ALL
+        .iter()
+        .map(|&b| SoundChoice::Builtin(b))
+        .chain(std::iter::once(SoundChoice::Custom(None)))
+        .collect();
+
+    let picker = pick_list(options, Some(app.sound_choice()), Message::AlertSoundPicked)
+        .font(FONT_REGULAR)
+        .text_size(13)
+        .width(Length::Fill);
+
+    let test_button = button(text("Test").font(FONT_REGULAR).size(13))
+        .padding([4.0, 12.0])
+        .style(banner_action_style)
+        .on_press(Message::TestSound);
+
+    let mut block = column![
+        text("Alert sound").font(FONT_REGULAR).size(13).color(TEXT),
+        row![picker, test_button].spacing(8).align_y(Alignment::Center),
+    ]
+    .spacing(6);
+
+    if let Some(error) = &app.sound_error {
+        block = block.push(text(error).font(FONT_REGULAR).size(12).color(RED));
+    }
+
+    block.into()
+}
+
+fn alert_volume_block(app: &App) -> Element<'_, Message> {
+    let value = app.config.effective_volume();
+    let header = row![
+        text("Alert volume").font(FONT_REGULAR).size(13).color(TEXT),
+        space::horizontal(),
+        text(format!("{:.0}%", value * 100.0)).font(FONT_REGULAR).size(13).color(TEXT_MUTED),
+    ];
+    let control = slider(0.0..=1.0, value, Message::AlertVolumeChanged)
+        .step(0.01)
+        .on_release(Message::SettingsCommitted);
+    column![header, control].spacing(6).into()
+}
+
+/// "Output device" picker: "System default" (maps to `output_device: None`)
+/// plus every device `Message::WindowOpened` enumerated. Falls back to just
+/// the default entry if enumeration ever comes back empty (no devices, or
+/// the window hasn't opened yet), so the control is never empty.
+fn output_device_block(app: &App) -> Element<'_, Message> {
+    let mut options = vec![SYSTEM_DEFAULT_DEVICE.to_string()];
+    options.extend(app.output_devices.iter().cloned());
+
+    let selected = app.config.output_device.clone().unwrap_or_else(|| SYSTEM_DEFAULT_DEVICE.to_string());
+
+    let picker = pick_list(options, Some(selected), |choice: String| {
+        Message::OutputDevicePicked(if choice == SYSTEM_DEFAULT_DEVICE { None } else { Some(choice) })
+    })
+    .font(FONT_REGULAR)
+    .text_size(13)
+    .width(Length::Fill);
+
+    column![text("Output device").font(FONT_REGULAR).size(13).color(TEXT), picker].spacing(6).into()
 }
 
 fn test_mode_row(app: &App) -> Element<'_, Message> {

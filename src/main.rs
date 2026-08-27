@@ -5,6 +5,7 @@ mod app;
 mod audio;
 mod bridge;
 mod config;
+mod decode;
 mod detector;
 mod engine;
 mod player;

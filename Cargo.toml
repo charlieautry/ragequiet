@@ -10,7 +10,9 @@ futures = "0.3.34"
 iced = { version = "0.14.0", default-features = false, features = ["canvas", "tokio", "tiny-skia"] }
 png = "0.18.1"
 realfft = "3.5.0"
+rfd = "0.17.2"
 serde = { version = "1.0.229", features = ["derive"] }
+symphonia = { version = "0.6.1", default-features = false, features = ["wav", "pcm", "mp3"] }
 toml = "1.1.4"
 tray-icon = "0.24.2"
 

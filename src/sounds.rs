@@ -26,7 +26,6 @@ pub const ALL: [BuiltinSound; 6] = [
 ];
 
 impl BuiltinSound {
-    #[allow(dead_code)] // wired into the settings sound picker (Phase 2d Task 3)
     pub fn label(&self) -> &'static str {
         match self {
             BuiltinSound::SoftBeep => "Soft beep",
