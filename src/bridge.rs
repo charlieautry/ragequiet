@@ -63,8 +63,11 @@ pub enum Command {
     SetTestMode(bool),
     SetEnabledIconBaseline, // resume(): re-announce color after enable toggle
     // Sent from app.rs starting with the calibration wizard (Phase 2c Task 2/3).
+    // The `Measurement` is built on the UI thread (it allocates: sample
+    // buffers + a realfft planner) and handed through pre-built so the audio
+    // callback's command drain never allocates.
     #[allow(dead_code)]
-    StartMeasurement(MeasurementKind),
+    StartMeasurement(MeasurementKind, Box<crate::engine::calibrate::Measurement>),
     #[allow(dead_code)]
     CancelMeasurement,
 }

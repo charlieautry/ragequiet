@@ -168,16 +168,24 @@ impl Detector {
             } => self.gate = AlertGate::new(hold_ms, cooldown_ms),
             Command::SetTestMode(on) => self.test_mode = on,
             Command::SetEnabledIconBaseline => self.resume(),
-            Command::StartMeasurement(kind) => {
-                let m = match kind {
-                    MeasurementKind::NoiseFloor => Measurement::noise_floor(),
-                    MeasurementKind::QuietPoint => Measurement::voiced_level(8.0),
-                    MeasurementKind::Ceiling => Measurement::voiced_level(5.0),
-                };
-                self.measurement = Some((kind, m, 0));
+            Command::StartMeasurement(kind, m) => {
+                self.measurement = Some((kind, *m, 0));
             }
             Command::CancelMeasurement => self.measurement = None,
         }
+    }
+}
+
+/// Kind -> `Measurement` constructor mapping. Built on the UI thread (it
+/// allocates: sample buffers + a realfft planner) and handed through
+/// `Command::StartMeasurement` pre-built, so the audio callback's command
+/// drain in `apply` never allocates.
+#[allow(dead_code)] // called from app.rs starting with the calibration wizard (Phase 2c Task 2/3)
+pub fn measurement_for(kind: MeasurementKind) -> Measurement {
+    match kind {
+        MeasurementKind::NoiseFloor => Measurement::noise_floor(),
+        MeasurementKind::QuietPoint => Measurement::voiced_level(8.0),
+        MeasurementKind::Ceiling => Measurement::voiced_level(5.0),
     }
 }
 
@@ -352,6 +360,7 @@ mod tests {
         let mut d = test_detector();
         d.apply(crate::bridge::Command::StartMeasurement(
             crate::bridge::MeasurementKind::NoiseFloor,
+            Box::new(measurement_for(crate::bridge::MeasurementKind::NoiseFloor)),
         ));
         let mut completed = None;
         for i in 0..200u64 {
@@ -375,6 +384,7 @@ mod tests {
         let mut d = test_detector();
         d.apply(crate::bridge::Command::StartMeasurement(
             crate::bridge::MeasurementKind::QuietPoint,
+            Box::new(measurement_for(crate::bridge::MeasurementKind::QuietPoint)),
         ));
         let mut emitted_progress = 0u32;
         for i in 0..50u64 {
@@ -410,6 +420,7 @@ mod tests {
         let mut d = test_detector();
         d.apply(crate::bridge::Command::StartMeasurement(
             crate::bridge::MeasurementKind::QuietPoint,
+            Box::new(measurement_for(crate::bridge::MeasurementKind::QuietPoint)),
         ));
         let voice = quiet_voice();
         let mut emitted_pcts = Vec::new();
@@ -450,6 +461,7 @@ mod tests {
         let mut d = test_detector();
         d.apply(crate::bridge::Command::StartMeasurement(
             crate::bridge::MeasurementKind::QuietPoint,
+            Box::new(measurement_for(crate::bridge::MeasurementKind::QuietPoint)),
         ));
         let voice = quiet_voice();
         // get a bit of progress going first
@@ -469,6 +481,7 @@ mod tests {
         let start = warm_up(&mut d);
         d.apply(crate::bridge::Command::StartMeasurement(
             crate::bridge::MeasurementKind::Ceiling,
+            Box::new(measurement_for(crate::bridge::MeasurementKind::Ceiling)),
         ));
         let loud = loud_voice();
         for i in 0..40u64 {
