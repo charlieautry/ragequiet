@@ -7,15 +7,17 @@
 use iced::theme::Palette;
 use iced::{Color, Font, Theme};
 
-pub const GREEN: Color = Color::from_rgb(46.0 / 255.0, 204.0 / 255.0, 113.0 / 255.0);
-pub const YELLOW: Color = Color::from_rgb(241.0 / 255.0, 196.0 / 255.0, 15.0 / 255.0);
-pub const RED: Color = Color::from_rgb(231.0 / 255.0, 76.0 / 255.0, 60.0 / 255.0);
+// Brand palette (assets/brand/README.md): green #3ed67a, amber #ffb020,
+// red #ff3b4a, ink #15171c.
+pub const GREEN: Color = Color::from_rgb8(0x3e, 0xd6, 0x7a);
+pub const YELLOW: Color = Color::from_rgb8(0xff, 0xb0, 0x20);
+pub const RED: Color = Color::from_rgb8(0xff, 0x3b, 0x4a);
 
-pub const BACKGROUND: Color = Color::from_rgb(0.08, 0.08, 0.09);
+pub const BACKGROUND: Color = Color::from_rgb8(0x15, 0x17, 0x1c);
 /// Slightly lighter panel color for the meter background; consumed by the
 /// meter canvas in a later task.
 #[expect(dead_code)]
-pub const SURFACE: Color = Color::from_rgb(0.12, 0.12, 0.14);
+pub const SURFACE: Color = Color::from_rgb8(0x1d, 0x20, 0x26);
 pub const TEXT: Color = Color::from_rgb(0.92, 0.92, 0.93);
 pub const TEXT_MUTED: Color = Color::from_rgb(0.55, 0.55, 0.58);
 

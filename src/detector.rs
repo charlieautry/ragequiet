@@ -1,23 +1,27 @@
 use crate::alert::AlertGate;
 use crate::engine::{Engine, State};
 
-pub const GREEN: [u8; 3] = [46, 204, 113];
-pub const YELLOW: [u8; 3] = [241, 196, 15];
-pub const RED: [u8; 3] = [231, 76, 60];
-pub const GREY: [u8; 3] = [127, 140, 141];
+/// Which brand tray icon should be showing; the actual colors/pixels live in
+/// the brand PNGs (`assets/brand/tray-*-32.png`), decoded once at boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrayState {
+    Quiet,
+    Warning,
+    Loud,
+}
 
-pub fn color_for(state: State) -> [u8; 3] {
+pub fn tray_state_for(state: State) -> TrayState {
     match state {
-        State::Quiet | State::Calm { .. } => GREEN,
-        State::GettingLoud { .. } => YELLOW,
-        State::TooLoud { .. } => RED,
+        State::Quiet | State::Calm { .. } => TrayState::Quiet,
+        State::GettingLoud { .. } => TrayState::Warning,
+        State::TooLoud { .. } => TrayState::Loud,
     }
 }
 
 /// Per-frame outcome for the UI thread.
 pub struct FrameOutcome {
-    /// Some(color) only when the tray icon must change.
-    pub color_change: Option<[u8; 3]>,
+    /// Some(state) only when the tray icon must change.
+    pub state_change: Option<TrayState>,
     pub beep: bool,
 }
 
@@ -39,7 +43,7 @@ fn level_of(state: State) -> f32 {
 pub struct Detector {
     engine: Engine,
     gate: AlertGate,
-    last_color: Option<[u8; 3]>,
+    last_state: Option<TrayState>,
     test_mode: bool,
     last_level_db: f32,
     peak_db: f32,
@@ -51,7 +55,7 @@ impl Detector {
         Self {
             engine,
             gate,
-            last_color: Some(GREEN),
+            last_state: Some(TrayState::Quiet),
             test_mode: false,
             last_level_db: SILENT_DB,
             peak_db: SILENT_DB,
@@ -76,20 +80,20 @@ impl Detector {
             self.peak_db = level_db;
             self.peak_at_ms = now_ms;
         }
-        let color = color_for(state);
-        let color_change = if self.last_color != Some(color) {
-            self.last_color = Some(color);
-            Some(color)
+        let tray_state = tray_state_for(state);
+        let state_change = if self.last_state != Some(tray_state) {
+            self.last_state = Some(tray_state);
+            Some(tray_state)
         } else {
             None
         };
-        FrameOutcome { color_change, beep }
+        FrameOutcome { state_change, beep }
     }
 
     /// Called when monitoring resumes after a pause: the next frame must
-    /// re-announce its color, and a shout in progress must re-earn the hold.
+    /// re-announce its state, and a shout in progress must re-earn the hold.
     pub fn resume(&mut self) {
-        self.last_color = None;
+        self.last_state = None;
         self.gate.reset();
     }
 
@@ -137,20 +141,20 @@ mod tests {
     }
 
     #[test]
-    fn first_frame_reports_no_change_when_already_green() {
+    fn first_frame_reports_no_change_when_already_quiet() {
         let mut d = test_detector();
         let out = d.on_frame(&silence(), 0);
-        assert!(out.color_change.is_none());
+        assert!(out.state_change.is_none());
         assert!(!out.beep);
     }
 
     #[test]
-    fn resume_forces_color_reannouncement() {
+    fn resume_forces_state_reannouncement() {
         let mut d = test_detector();
-        assert!(d.on_frame(&silence(), 0).color_change.is_none());
+        assert!(d.on_frame(&silence(), 0).state_change.is_none());
         d.resume();
-        // same state as before, but after resume the color must be re-sent
-        assert_eq!(d.on_frame(&silence(), 32).color_change, Some(GREEN));
+        // same state as before, but after resume it must be re-sent
+        assert_eq!(d.on_frame(&silence(), 32).state_change, Some(TrayState::Quiet));
     }
 
     #[test]
@@ -158,7 +162,7 @@ mod tests {
         let mut d = test_detector();
         for i in 0..100 {
             let out = d.on_frame(&silence(), i * 32);
-            assert!(out.color_change.is_none(), "frame {i} sent a change");
+            assert!(out.state_change.is_none(), "frame {i} sent a change");
         }
     }
 
@@ -218,11 +222,15 @@ mod tests {
         for i in 0..40 {
             let out = d.on_frame(&loud, start + i * FRAME_MS);
             assert!(!out.beep, "test mode must never beep (frame {i})");
-            if let Some(c) = out.color_change {
-                loud_marker = Some(c);
+            if let Some(s) = out.state_change {
+                loud_marker = Some(s);
             }
         }
-        assert_eq!(loud_marker, Some(RED), "the icon must still go red in test mode");
+        assert_eq!(
+            loud_marker,
+            Some(TrayState::Loud),
+            "the icon must still go to the loud state in test mode"
+        );
 
         // control: the same drive without test mode does beep
         let mut d = test_detector();
@@ -274,11 +282,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_enabled_icon_baseline_reannounces_color() {
+    fn apply_enabled_icon_baseline_reannounces_state() {
         let mut d = test_detector();
-        assert!(d.on_frame(&silence(), 0).color_change.is_none());
+        assert!(d.on_frame(&silence(), 0).state_change.is_none());
         d.apply(crate::bridge::Command::SetEnabledIconBaseline);
-        assert_eq!(d.on_frame(&silence(), 32).color_change, Some(GREEN));
+        assert_eq!(d.on_frame(&silence(), 32).state_change, Some(TrayState::Quiet));
     }
 
     #[test]

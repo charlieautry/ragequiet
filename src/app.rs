@@ -7,19 +7,20 @@ use futures::SinkExt;
 use iced::widget::{column, container, text};
 use iced::{window, Element, Subscription, Task, Theme};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
+use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::alert::AlertGate;
 use crate::bridge::{self, Command, CommandTx, SharedLevels};
 use crate::config::{CalibrationState, Config};
-use crate::detector::{Detector, GREEN, GREY};
+use crate::detector::{Detector, TrayState};
 use crate::engine::Engine;
 use crate::ui;
+use crate::ui::icons::TrayIcons;
 use crate::{alert, audio};
 
 /// Rare events pushed from the audio callback to the UI.
 enum AudioEvent {
-    Color([u8; 3]),
+    State(TrayState),
     Beeped,
 }
 
@@ -62,6 +63,7 @@ pub struct App {
     /// None when the input device could not be opened; the app still runs.
     stream: Option<cpal::Stream>,
     tuning_meta: TuningMeta,
+    icons: TrayIcons,
     /// (level_db, threshold_db, peak_db) sampled on Tick so `view` stays pure.
     latest: (f32, f32, f32),
 }
@@ -69,7 +71,7 @@ pub struct App {
 #[derive(Debug, Clone)]
 pub enum Message {
     MenuEvent(MenuId),
-    ColorChange([u8; 3]),
+    TrayStateChanged(TrayState),
     Beeped,
     WindowOpened(window::Id),
     WindowClosed(window::Id),
@@ -132,8 +134,8 @@ impl App {
                 alert::play_beep();
                 let _ = events.send(AudioEvent::Beeped);
             }
-            if let Some(color) = outcome.color_change {
-                let _ = events.send(AudioEvent::Color(color));
+            if let Some(state) = outcome.state_change {
+                let _ = events.send(AudioEvent::State(state));
             }
         })
         .ok();
@@ -157,12 +159,17 @@ impl App {
             &quit_item,
         ]);
 
-        // No stream means nothing is being monitored: say so with the grey icon.
-        let initial_color = if stream.is_some() { GREEN } else { GREY };
+        let icons = TrayIcons::load();
+        // No stream means nothing is being monitored: say so with the off icon.
+        let initial_icon = if stream.is_some() {
+            icons.quiet.clone()
+        } else {
+            icons.off.clone()
+        };
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("Ragequiet")
-            .with_icon(make_icon(initial_color))
+            .with_icon(initial_icon)
             .build()
             .expect("build tray icon");
 
@@ -181,6 +188,7 @@ impl App {
                 commands,
                 stream,
                 tuning_meta,
+                icons,
                 latest: (0.0, 0.0, 0.0),
             },
             Task::none(), // no window at launch: the app lives in the tray
@@ -207,9 +215,9 @@ impl App {
                 }
                 Task::none()
             }
-            Message::ColorChange(rgb) => {
+            Message::TrayStateChanged(state) => {
                 if self.enabled {
-                    let _ = self.tray.set_icon(Some(make_icon(rgb)));
+                    let _ = self.tray.set_icon(Some(self.icons.for_state(state)));
                 }
                 Task::none()
             }
@@ -307,6 +315,7 @@ impl App {
         let (_, open) = window::open(window::Settings {
             size: iced::Size::new(380.0, 520.0),
             resizable: false,
+            icon: Some(ui::icons::window_icon()),
             ..window::Settings::default()
         });
         open.map(Message::WindowOpened)
@@ -315,18 +324,18 @@ impl App {
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if enabled {
-            // Re-announce the colour on the next frame and make an in-progress
+            // Re-announce the state on the next frame and make an in-progress
             // shout re-earn its hold.
             let _ = self.commands.send(Command::SetEnabledIconBaseline);
             if let Some(stream) = &self.stream {
                 let _ = stream.play();
             }
-            let _ = self.tray.set_icon(Some(make_icon(GREEN)));
+            let _ = self.tray.set_icon(Some(self.icons.quiet.clone()));
         } else {
             if let Some(stream) = &self.stream {
                 let _ = stream.pause();
             }
-            let _ = self.tray.set_icon(Some(make_icon(GREY)));
+            let _ = self.tray.set_icon(Some(self.icons.off.clone()));
         }
     }
 
@@ -377,7 +386,7 @@ fn audio_event_subscription() -> Subscription<Message> {
                     std::thread::spawn(move || {
                         while let Ok(event) = receiver.recv() {
                             let message = match event {
-                                AudioEvent::Color(rgb) => Message::ColorChange(rgb),
+                                AudioEvent::State(state) => Message::TrayStateChanged(state),
                                 AudioEvent::Beeped => Message::Beeped,
                             };
                             if futures::executor::block_on(output.send(message)).is_err() {
@@ -391,22 +400,4 @@ fn audio_event_subscription() -> Subscription<Message> {
             },
         )
     })
-}
-
-/// 32x32 filled circle in the given color; generated in code, no asset files.
-fn make_icon(rgb: [u8; 3]) -> Icon {
-    const S: i32 = 32;
-    let mut rgba = Vec::with_capacity((S * S * 4) as usize);
-    for y in 0..S {
-        for x in 0..S {
-            let (dx, dy) = (x - S / 2, y - S / 2);
-            let a = if dx * dx + dy * dy <= (S / 2 - 1).pow(2) {
-                255
-            } else {
-                0
-            };
-            rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], a]);
-        }
-    }
-    Icon::from_rgba(rgba, S as u32, S as u32).expect("valid icon buffer")
 }
