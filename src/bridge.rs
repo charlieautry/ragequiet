@@ -68,6 +68,11 @@ pub enum Command {
     // allocates.
     StartMeasurement(MeasurementKind, Box<crate::engine::calibrate::Measurement>),
     CancelMeasurement,
+    /// The calibration wizard is open (true) or has been left (false):
+    /// suppresses beeps for its whole lifetime, not just while a measurement
+    /// is actively accumulating — between steps the wizard has just coached
+    /// the user to be loud against the old threshold.
+    SetWizardActive(bool),
 }
 
 pub type CommandTx = std::sync::mpsc::Sender<Command>;

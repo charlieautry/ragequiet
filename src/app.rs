@@ -392,6 +392,7 @@ impl App {
                 // finished result either — restarting is the user choosing
                 // to redo it, not to keep what they had.
                 self.teardown_wizard(false);
+                let _ = self.commands.send(Command::SetWizardActive(true));
                 self.wizard = Some(Wizard::new(local_hour()));
                 // Started from the tray with no window: the wizard has to be
                 // visible to be usable, so open one (no-op if already open).
@@ -424,6 +425,10 @@ impl App {
                 if let Some(result) = result {
                     self.apply_calibration(result);
                     self.wizard = None;
+                    // Finish is an exit from the wizard just like the other
+                    // paths: the alert suppression it started on `WizardStarted`
+                    // must not outlive it.
+                    let _ = self.commands.send(Command::SetWizardActive(false));
                 }
                 Task::none()
             }
@@ -548,6 +553,7 @@ impl App {
             self.apply_calibration(result);
         }
         self.cancel_wizard();
+        let _ = self.commands.send(Command::SetWizardActive(false));
     }
 
     /// Persist a finished calibration and make it live: config write, engine

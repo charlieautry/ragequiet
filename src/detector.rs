@@ -64,6 +64,11 @@ pub struct Detector {
     /// and the last whole-percent progress value emitted for it (so repeat
     /// frames at the same percent don't spam the UI).
     measurement: Option<(MeasurementKind, Measurement, u32)>,
+    /// True for the wizard's whole lifetime (Intro through Done), not just
+    /// while a measurement is accumulating: suppresses beeps between steps
+    /// too, since the alert path would otherwise fire against the old
+    /// threshold right after the wizard coached the user to be loud.
+    wizard_active: bool,
 }
 
 impl Detector {
@@ -77,6 +82,7 @@ impl Detector {
             peak_db: SILENT_DB,
             peak_at_ms: 0,
             measurement: None,
+            wizard_active: false,
         }
     }
 
@@ -106,14 +112,16 @@ impl Detector {
         let state = self.engine.process(frame);
         // Test mode still drives the icon and the meter; it only mutes the
         // speaker, so the gate keeps running and its timing stays honest.
-        // Measurements suppress the beep the same way (the ceiling step asks
-        // the user to be loud on purpose) while still updating the gate so
-        // its cooldown state stays sane once the measurement ends.
+        // The whole wizard suppresses the beep the same way (an active
+        // measurement asks the user to be loud on purpose, and the steps in
+        // between still show the old threshold, right after that coaching)
+        // while still updating the gate so its cooldown state stays sane
+        // once the wizard ends.
         let beep = self
             .gate
             .update(matches!(state, State::TooLoud { .. }), now_ms)
             && !self.test_mode
-            && !measuring;
+            && !(measuring || self.wizard_active);
         let level_db = level_of(state);
         self.last_level_db = level_db;
         // `>=`, not `>`: a frame that merely ties the peak is still a fresh
@@ -177,6 +185,7 @@ impl Detector {
                 self.measurement = Some((kind, *m, 0));
             }
             Command::CancelMeasurement => self.measurement = None,
+            Command::SetWizardActive(active) => self.wizard_active = active,
         }
     }
 }
@@ -496,6 +505,22 @@ mod tests {
         let resume_start = start + 40 * FRAME_MS;
         let fired = first_beep_offset_ms(&mut d, resume_start, 80);
         assert!(fired.is_some(), "beep must be functional again after the measurement ends");
+    }
+
+    #[test]
+    fn wizard_active_suppresses_beep_with_no_measurement_active() {
+        let mut d = test_detector();
+        let start = warm_up(&mut d);
+        d.apply(crate::bridge::Command::SetWizardActive(true));
+        let loud = loud_voice();
+        for i in 0..40u64 {
+            let out = d.on_frame(&loud, start + i * FRAME_MS);
+            assert!(!out.beep, "beep must be suppressed while the wizard is active (frame {i})");
+        }
+        d.apply(crate::bridge::Command::SetWizardActive(false));
+        let resume_start = start + 40 * FRAME_MS;
+        let fired = first_beep_offset_ms(&mut d, resume_start, 80);
+        assert!(fired.is_some(), "beep must be functional again once the wizard ends");
     }
 
     #[test]
