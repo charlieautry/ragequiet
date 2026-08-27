@@ -12,6 +12,7 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::alert::AlertGate;
 use crate::audio;
+use crate::autostart;
 use crate::bridge::{self, Command, CommandTx, SharedLevels};
 use crate::config::{AlertSound, CalibrationState, Config, DeviceCalibration};
 use crate::decode;
@@ -179,6 +180,14 @@ pub struct App {
     /// opens (never per-frame/per-Tick). "System default" is prepended in
     /// the view, not stored here.
     pub(crate) output_devices: Vec<String>,
+    /// Whether launch-at-login is currently on, per the registry (the
+    /// runtime source of truth — see `crate::autostart`). Refreshed from
+    /// `autostart::autostart_enabled()` at boot and on every `WindowOpened`,
+    /// same pattern as `output_devices`.
+    pub(crate) autostart: bool,
+    /// Inline settings-UI error from the most recent failed `set_autostart`
+    /// call; cleared on the next successful toggle. Mirrors `sound_error`.
+    pub(crate) autostart_error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -234,6 +243,9 @@ pub enum Message {
     /// The settings window's Test button: plays the configured sound at the
     /// configured volume/device, independent of the detector.
     TestSound,
+    /// The "Start with Windows" toggler changed; calls `set_autostart`
+    /// before touching any state (see the handler for the error path).
+    AutostartToggled(bool),
     Quit,
 }
 
@@ -380,6 +392,8 @@ impl App {
                 custom_sound_rate,
                 sound_error,
                 output_devices: Vec::new(),
+                autostart: autostart::autostart_enabled(),
+                autostart_error: None,
             },
             Task::none(), // no window at launch: the app lives in the tray
         )
@@ -434,6 +448,11 @@ impl App {
                 self.today = local_date();
                 self.hour = local_hour();
                 self.output_devices = enumerate_output_devices();
+                // The registry is the runtime source of truth: re-read it
+                // every time the window opens so an out-of-band change
+                // (e.g. hand-edited via regedit) is reflected rather than
+                // trusting a possibly-stale cached value.
+                self.autostart = autostart::autostart_enabled();
                 round_corners(id)
             }
             Message::WindowClosed(id) => {
@@ -629,6 +648,25 @@ impl App {
                     volume: self.config.effective_volume(),
                     device_name: self.config.output_device.clone(),
                 });
+                Task::none()
+            }
+            Message::AutostartToggled(enabled) => {
+                // Registry write first: only reflect the new state (cache +
+                // config + commit) on success, and never flip the checkbox
+                // on failure — the UI must stay honest about what's
+                // actually in the registry.
+                match autostart::set_autostart(enabled) {
+                    Ok(()) => {
+                        self.autostart = enabled;
+                        self.autostart_error = None;
+                        self.config.start_with_windows = enabled;
+                        self.config_dirty = true;
+                        self.commit_config();
+                    }
+                    Err(e) => {
+                        self.autostart_error = Some(format!("Could not update Windows startup: {e}"));
+                    }
+                }
                 Task::none()
             }
             Message::Quit => {

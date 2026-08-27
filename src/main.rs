@@ -3,6 +3,7 @@
 mod alert;
 mod app;
 mod audio;
+mod autostart;
 mod bridge;
 mod config;
 mod decode;
@@ -13,6 +14,13 @@ mod sounds;
 mod ui;
 
 fn main() -> iced::Result {
+    // Single-instance guard: a second launch (e.g. from autostart racing a
+    // manual start, or a user double-clicking the exe again) must exit
+    // immediately rather than opening a second tray icon/audio stream.
+    if !autostart::acquire_single_instance() {
+        return Ok(());
+    }
+
     iced::daemon(app::App::boot, app::App::update, app::App::view)
         .subscription(app::App::subscription)
         .theme(app::App::theme)

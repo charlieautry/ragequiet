@@ -77,6 +77,12 @@ pub struct Config {
     /// `None` = the system default output device.
     #[serde(default)]
     pub output_device: Option<String>,
+    /// Mirrors the user's last intent for launch-at-login. The registry
+    /// (`autostart::autostart_enabled()`) is the runtime source of truth;
+    /// this field only exists so the setting round-trips through the config
+    /// file for completeness — see `App`'s cached `autostart` field.
+    #[serde(default)]
+    pub start_with_windows: bool,
 }
 
 impl Default for Config {
@@ -89,6 +95,7 @@ impl Default for Config {
             alert_sound: AlertSound::default(),
             alert_volume: 0.8,
             output_device: None,
+            start_with_windows: false,
         }
     }
 }
@@ -132,6 +139,7 @@ struct RawConfig {
     alert_sound: AlertSound,
     alert_volume: f32,
     output_device: Option<String>,
+    start_with_windows: bool,
 }
 
 impl Default for RawConfig {
@@ -145,6 +153,7 @@ impl Default for RawConfig {
             alert_sound: d.alert_sound,
             alert_volume: d.alert_volume,
             output_device: d.output_device,
+            start_with_windows: d.start_with_windows,
         }
     }
 }
@@ -167,6 +176,7 @@ impl RawConfig {
             alert_sound: self.alert_sound,
             alert_volume: self.alert_volume,
             output_device: self.output_device,
+            start_with_windows: self.start_with_windows,
         }
     }
 }
@@ -469,6 +479,23 @@ mod alert_tests {
         assert_eq!(cfg.alert_sound, AlertSound::Builtin(BuiltinSound::SoftBeep));
         assert_eq!(cfg.alert_volume, 0.8);
         assert_eq!(cfg.output_device, None);
+        assert!(!cfg.start_with_windows);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn default_start_with_windows_is_false() {
+        assert!(!Config::default().start_with_windows);
+    }
+
+    #[test]
+    fn start_with_windows_round_trips() {
+        let path = temp_config_path("start-with-windows");
+        let cfg = Config { start_with_windows: true, ..Config::default() };
+        cfg.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path);
+        assert_eq!(loaded, cfg);
+        assert!(loaded.start_with_windows);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

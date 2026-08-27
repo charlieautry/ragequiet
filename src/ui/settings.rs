@@ -70,6 +70,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 .push(alert_volume_block(app))
                 .push(output_device_block(app))
                 .push(test_mode_row(app))
+                .push(autostart_block(app))
                 .push(input_line(app))
                 .into()
         }
@@ -446,6 +447,24 @@ fn test_mode_row(app: &App) -> Element<'_, Message> {
         .on_toggle(Message::TestModeToggled)
         .font(FONT_REGULAR)
         .into()
+}
+
+/// "Start with Windows" toggler: state comes from `app.autostart`, refreshed
+/// from the registry on every `WindowOpened` (see `App::boot`/`WindowOpened`
+/// handler) rather than from `config.start_with_windows`, since the registry
+/// is the runtime source of truth. A failed toggle shows an inline muted
+/// error line instead of touching the checkbox.
+fn autostart_block(app: &App) -> Element<'_, Message> {
+    let mut block = column![
+        toggler(app.autostart).label("Start with Windows").on_toggle(Message::AutostartToggled).font(FONT_REGULAR),
+    ]
+    .spacing(6);
+
+    if let Some(error) = &app.autostart_error {
+        block = block.push(text(error).font(FONT_REGULAR).size(12).color(RED));
+    }
+
+    block.into()
 }
 
 fn input_line(app: &App) -> Element<'_, Message> {
