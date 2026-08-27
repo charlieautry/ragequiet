@@ -38,6 +38,13 @@ impl FrameBuilder {
     }
 }
 
+/// Name of the default input device, for config lookups.
+pub fn default_input_name() -> Option<String> {
+    cpal::default_host()
+        .default_input_device()
+        .map(|d| d.to_string())
+}
+
 /// Opens the default input device and calls `on_frame` with mono 16 kHz frames.
 /// Returns the stream; caller must keep it alive and call .play().
 pub fn start_input(

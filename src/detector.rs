@@ -30,10 +30,10 @@ pub struct Detector {
 }
 
 impl Detector {
-    pub fn new() -> Self {
+    pub fn new(engine: Engine, gate: AlertGate) -> Self {
         Self {
-            engine: Engine::new(),
-            gate: AlertGate::new(300, 3000),
+            engine,
+            gate,
             last_color: Some(GREEN),
         }
     }
@@ -61,12 +61,6 @@ impl Detector {
     }
 }
 
-impl Default for Detector {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -76,9 +70,13 @@ mod tests {
         vec![0.0; FRAME_SIZE]
     }
 
+    fn test_detector() -> Detector {
+        Detector::new(Engine::new(), AlertGate::new(300, 3000))
+    }
+
     #[test]
     fn first_frame_reports_no_change_when_already_green() {
-        let mut d = Detector::new();
+        let mut d = test_detector();
         let out = d.on_frame(&silence(), 0);
         assert!(out.color_change.is_none());
         assert!(!out.beep);
@@ -86,7 +84,7 @@ mod tests {
 
     #[test]
     fn resume_forces_color_reannouncement() {
-        let mut d = Detector::new();
+        let mut d = test_detector();
         assert!(d.on_frame(&silence(), 0).color_change.is_none());
         d.resume();
         // same state as before, but after resume the color must be re-sent
@@ -95,7 +93,7 @@ mod tests {
 
     #[test]
     fn steady_state_sends_nothing() {
-        let mut d = Detector::new();
+        let mut d = test_detector();
         for i in 0..100 {
             let out = d.on_frame(&silence(), i * 32);
             assert!(out.color_change.is_none(), "frame {i} sent a change");

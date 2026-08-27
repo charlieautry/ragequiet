@@ -2,13 +2,14 @@
 
 mod alert;
 mod audio;
-#[allow(dead_code)] // used from the config wiring task on
 mod config;
 mod detector;
 mod engine;
 
+use alert::AlertGate;
 use cpal::traits::StreamTrait;
 use detector::{Detector, GREEN, GREY};
+use engine::Engine;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tao::event::Event;
@@ -41,6 +42,19 @@ fn make_icon(rgb: [u8; 3]) -> Icon {
 }
 
 fn main() -> anyhow::Result<()> {
+    let config = config::Config::load();
+    if let Some(path) = config::Config::path()
+        && !path.exists()
+    {
+        let _ = config.save(); // first run: materialize the file for users to find
+    }
+    let device_name = audio::default_input_name().unwrap_or_else(|| "unknown input".into());
+    let tuning = config
+        .calibration
+        .get(&device_name)
+        .map(|c| c.tuning())
+        .unwrap_or_default();
+
     // tao 0.37's `EventLoopBuilder::build` takes `&mut self`, so the builder
     // needs its own mutable binding before we can call `.build()` on it.
     let mut event_loop_builder = EventLoopBuilder::<AppEvent>::with_user_event();
@@ -62,7 +76,10 @@ fn main() -> anyhow::Result<()> {
         .with_icon(make_icon(GREEN))
         .build()?;
 
-    let mut detector = Detector::new();
+    let mut detector = Detector::new(
+        Engine::with_tuning(tuning),
+        AlertGate::new(config.hold_ms, config.cooldown_ms),
+    );
     let start = std::time::Instant::now();
     let resume_flag = Arc::new(AtomicBool::new(false));
     let callback_resume_flag = Arc::clone(&resume_flag);
