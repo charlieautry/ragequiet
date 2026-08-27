@@ -3,11 +3,12 @@
 //! single column, generous spacing. The meter itself is a placeholder slot
 //! here; Task 4 mounts the real canvas.
 
-use iced::widget::{button, column, container, mouse_area, row, slider, space, text, toggler};
+use iced::widget::{button, canvas, column, container, mouse_area, row, slider, space, text, toggler};
 use iced::{Alignment, Element, Length, Theme};
 
 use crate::app::{App, Message};
 use crate::detector::TrayState;
+use crate::ui::meter::Meter;
 use crate::ui::theme::{BACKGROUND, FONT_REGULAR, FONT_SEMIBOLD, GREEN, RED, SURFACE, TEXT, TEXT_MUTED, YELLOW};
 
 /// Seconds shown/edited by the cooldown slider; the config field stays in ms.
@@ -24,7 +25,7 @@ pub fn cooldown_s_to_ms(seconds: u64) -> u64 {
 pub fn view(app: &App) -> Element<'_, Message> {
     let content = column![
         chrome_row(),
-        meter_placeholder(),
+        meter_panel(app),
         status_line(app),
         alerts_line(app),
         sensitivity_block(app),
@@ -79,18 +80,27 @@ fn close_button_style(_theme: &Theme, status: button::Status) -> button::Style {
     button::Style { text_color, ..button::Style::default() }
 }
 
-/// A fixed-size slot where the meter canvas will live (Task 4); for now just
-/// a labeled panel so the layout reads correctly.
-fn meter_placeholder<'a>() -> Element<'a, Message> {
-    container(text("meter").font(FONT_REGULAR).size(12).color(TEXT_MUTED))
-        .center_x(Length::Fill)
-        .center_y(Length::Fixed(48.0))
-        .style(|_theme: &Theme| container::Style {
-            background: Some(SURFACE.into()),
-            border: iced::border::rounded(8.0),
-            ..container::Style::default()
-        })
-        .into()
+/// The live level meter: current level filled from the left in the state
+/// color, calibration markers (noise floor / quiet point / threshold /
+/// ceiling) drawn behind it, red-shaded region past the threshold. Paused
+/// (`!app.enabled`) shows an empty bar with the markers still visible, since
+/// they're a property of the calibration, not the live signal.
+fn meter_panel(app: &App) -> Element<'_, Message> {
+    let (raw_level_db, threshold_db, raw_peak_db) = app.latest;
+    let (level_db, peak_db) = if app.enabled { (raw_level_db, raw_peak_db) } else { (-100.0, -100.0) };
+
+    canvas(Meter {
+        level_db,
+        threshold_db,
+        peak_db,
+        noise_floor_db: app.tuning_meta.noise_floor_db,
+        quiet_db: app.tuning_meta.quiet_db,
+        ceiling_db: app.tuning_meta.ceiling_db,
+        ceiling_confirmed: app.tuning_meta.ceiling_confirmed,
+    })
+    .width(Length::Fill)
+    .height(Length::Fixed(48.0))
+    .into()
 }
 
 fn status_line(app: &App) -> Element<'_, Message> {

@@ -38,7 +38,6 @@ struct MenuIds {
 
 /// Static markers the meter draws behind the live level, snapshotted from the
 /// device's calibration at boot.
-#[expect(dead_code)] // consumed by the settings view + meter in a later task
 pub struct TuningMeta {
     pub noise_floor_db: f32,
     pub quiet_db: Option<f32>,
@@ -65,7 +64,7 @@ pub struct App {
     pub(crate) tuning_meta: TuningMeta,
     icons: TrayIcons,
     /// (level_db, threshold_db, peak_db) sampled on Tick so `view` stays pure.
-    latest: (f32, f32, f32),
+    pub(crate) latest: (f32, f32, f32),
     /// Last tray state seen, for the settings window's status line.
     pub(crate) latest_tray_state: TrayState,
 }
