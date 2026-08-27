@@ -85,14 +85,12 @@ impl Engine {
 
     /// Current effective threshold including adaptive drift. `&mut` because the
     /// rolling median computes lazily.
-    #[allow(dead_code)] // used from the settings UI on
     pub fn threshold_db(&mut self) -> f32 {
         self.threshold_for(None)
     }
 
     /// Swap detection anchors on a live engine without touching the adaptive
     /// baselines — a sensitivity tweak keeps accumulated drift context.
-    #[allow(dead_code)] // used from the settings UI on
     pub fn set_tuning(&mut self, tuning: Tuning) {
         self.tuning = tuning;
     }
