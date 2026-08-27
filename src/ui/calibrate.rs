@@ -218,31 +218,56 @@ fn instruction(kind: MeasurementKind) -> &'static str {
 /// The wizard body, rendered under the settings window's chrome row in place
 /// of the normal controls. `meter` is the same live meter canvas the settings
 /// view builds, passed in so the user watches their own level while
-/// calibrating (and so this stays free of `App`).
-pub fn view<'a>(wizard: &Wizard, meter: Element<'a, Message>) -> Element<'a, Message> {
+/// calibrating (and so this stays free of `App`). `monitoring_paused` and
+/// `stall_hint` only affect the `Measuring` step (see the muted lines under
+/// its progress bar); `device_changed` only affects `Intro`'s note.
+pub fn view<'a>(
+    wizard: &Wizard,
+    meter: Element<'a, Message>,
+    monitoring_paused: bool,
+    stall_hint: bool,
+    device_changed: bool,
+) -> Element<'a, Message> {
     let content: Element<'a, Message> = match &wizard.step {
-        WizardStep::Intro => column![
-            heading("Calibrate for this mic"),
-            body_text(
-                "Takes under a minute: three seconds of silence, then two short voice \
-                 samples. Ragequiet learns what quiet and loud sound like on this \
-                 microphone so it only nudges you when you're actually too loud."
-            ),
-            meter,
-            buttons(vec![primary("Start", Message::WizardEvent(WizardEvent::Begin))]),
-        ]
-        .spacing(16)
-        .into(),
+        WizardStep::Intro => {
+            let mut block = column![
+                heading("Calibrate for this mic"),
+                body_text(
+                    "Takes under a minute: three seconds of silence, then two short voice \
+                     samples. Ragequiet learns what quiet and loud sound like on this \
+                     microphone so it only nudges you when you're actually too loud."
+                ),
+            ]
+            .spacing(16);
+            if device_changed {
+                block = block.push(body_text(
+                    "Note: the default microphone changed since launch. Restart the app \
+                     to capture from the new one.",
+                ));
+            }
+            block
+                .push(meter)
+                .push(buttons(vec![primary("Start", Message::WizardEvent(WizardEvent::Begin))]))
+                .into()
+        }
 
-        WizardStep::Measuring { kind, progress } => column![
-            heading(instruction(*kind)),
-            // `girth` is iced 0.14's cross-axis size for the bar (`height`
-            // on a horizontal one); `height` itself is not public here.
-            progress_bar(0.0..=1.0, *progress).girth(Length::Fixed(8.0)),
-            meter,
-        ]
-        .spacing(16)
-        .into(),
+        WizardStep::Measuring { kind, progress } => {
+            let mut block = column![
+                heading(instruction(*kind)),
+                // `girth` is iced 0.14's cross-axis size for the bar
+                // (`height` on a horizontal one); `height` itself is not
+                // public here.
+                progress_bar(0.0..=1.0, *progress).girth(Length::Fixed(8.0)),
+            ]
+            .spacing(16);
+            if monitoring_paused {
+                block = block.push(body_text("Monitoring is paused — re-enable it to continue."));
+            }
+            if stall_hint {
+                block = block.push(body_text("Waiting to hear your voice — speak at the target volume."));
+            }
+            block.push(meter).into()
+        }
 
         WizardStep::NoiseDone { noise_db } => column![
             heading(format!("Noise floor: {noise_db:.0} dB")),

@@ -54,9 +54,18 @@ pub fn view(app: &App) -> Element<'_, Message> {
     // stays, so the window is still movable/closable); the live meter is
     // handed to it so users watch their own level while calibrating.
     let body: Element<'_, Message> = match &app.wizard {
-        Some(wizard) => crate::ui::calibrate::view(wizard, meter_panel(app)),
+        Some(wizard) => crate::ui::calibrate::view(
+            wizard,
+            meter_panel(app),
+            !app.enabled || !app.has_stream(),
+            app.wizard_stall_hint(),
+            app.device_changed_note,
+        ),
         None => {
             let mut col = column![].spacing(16).width(Length::Fill);
+            if let Some(error) = &app.wizard_error {
+                col = col.push(wizard_error_row(error));
+            }
             if let Some(banner) = banner_row(app) {
                 col = col.push(banner);
             }
@@ -72,6 +81,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 .push(test_mode_row(app))
                 .push(autostart_block(app))
                 .push(input_line(app))
+                .push(cpu_line(app))
                 .into()
         }
     };
@@ -127,6 +137,15 @@ fn chrome_row<'a>() -> Element<'a, Message> {
         .width(Length::Fill)
         .height(Length::Fixed(36.0))
         .into()
+}
+
+/// Inline notice shown when the tray "Recalibrate"/banner Calibrate buttons
+/// were pressed with no input device open (see `Message::WizardStarted`'s
+/// gating) — the same muted-error idiom as `sound_error`/`autostart_error`,
+/// just placed up top near the banner since there's no specific control it
+/// hangs off of.
+fn wizard_error_row(message: &str) -> Element<'_, Message> {
+    text(message.to_string()).font(FONT_REGULAR).size(12).color(TEXT_MUTED).width(Length::Fill).into()
 }
 
 /// A one-line dismissible reminder at the top of the controls view: never
@@ -471,6 +490,18 @@ fn input_line(app: &App) -> Element<'_, Message> {
     // The device name is arbitrary, driver-supplied text (easily 60+ chars);
     // an explicit fill width lets it wrap across lines instead of clipping.
     text(format!("Input: {}", app.device_name))
+        .font(FONT_REGULAR)
+        .size(12)
+        .color(TEXT_MUTED)
+        .width(Length::Fill)
+        .into()
+}
+
+/// This process's own CPU usage (spec §7), smoothed on `Tick` — see
+/// `App::cpu_percent_smoothed`. Reads 0.0 on non-Windows targets, where
+/// `sysinfo::process_cpu_100ns` never returns a sample.
+fn cpu_line(app: &App) -> Element<'_, Message> {
+    text(format!("CPU: {:.1}%", app.cpu_percent_smoothed))
         .font(FONT_REGULAR)
         .size(12)
         .color(TEXT_MUTED)

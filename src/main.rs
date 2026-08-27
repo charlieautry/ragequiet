@@ -11,6 +11,7 @@ mod detector;
 mod engine;
 mod player;
 mod sounds;
+mod sysinfo;
 mod ui;
 
 fn main() -> iced::Result {

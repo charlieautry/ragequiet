@@ -13,13 +13,14 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 use crate::alert::AlertGate;
 use crate::audio;
 use crate::autostart;
-use crate::bridge::{self, Command, CommandTx, SharedLevels};
+use crate::bridge::{self, Command, CommandTx, MeasurementKind, SharedLevels};
 use crate::config::{AlertSound, CalibrationState, Config, DeviceCalibration};
 use crate::decode;
 use crate::detector::{Detector, MeasurementUpdate, TrayState};
 use crate::engine::Engine;
 use crate::player::{PlayRequest, Player};
 use crate::sounds::{self, BuiltinSound};
+use crate::sysinfo;
 use crate::ui;
 use crate::ui::calibrate::{Wizard, WizardEvent, WizardResult, WizardStep};
 use crate::ui::icons::{TrayIconSets, TrayIcons};
@@ -188,6 +189,33 @@ pub struct App {
     /// Inline settings-UI error from the most recent failed `set_autostart`
     /// call; cleared on the next successful toggle. Mirrors `sound_error`.
     pub(crate) autostart_error: Option<String>,
+    /// Inline settings-UI note shown when the tray "Recalibrate"/banner
+    /// Calibrate buttons are pressed with no input device open. Cleared the
+    /// next time a wizard is actually started.
+    pub(crate) wizard_error: Option<String>,
+    /// Set at `WizardStarted` when the default input device's name no longer
+    /// matches `device_name` (the stream itself stays on the old device — see
+    /// the wizard's Intro step, which renders the honest note when this is
+    /// true).
+    pub(crate) device_changed_note: bool,
+    /// The `Measuring` step's progress value as of the last time it actually
+    /// changed (either a fresh `Progress` event, or the last `Tick` that
+    /// noticed a change) — compared against on every `Tick` to detect a
+    /// stalled (voice-not-heard) measurement.
+    measure_progress_seen: f32,
+    /// Ticks (each ~80 ms) since `measure_progress_seen` last changed, while
+    /// a voiced `Measuring` step is running; drives `stall_hint_visible`.
+    pub(crate) measure_stalled_ticks: u32,
+    /// This process's own CPU time samples for the settings window's CPU
+    /// readout, updated each `Tick`; `None` until the first sample lands.
+    cpu_sample: Option<(u64, u64)>,
+    /// Fixed reference instant for converting `Instant::elapsed()` into the
+    /// same 100-ns units `GetProcessTimes` reports in.
+    cpu_epoch: std::time::Instant,
+    /// Exponentially smoothed CPU percent (`smoothed = smoothed*0.7 + pct*0.3`)
+    /// shown in the settings window; stays at 0.0 on non-Windows targets
+    /// (`sysinfo::process_cpu_100ns` returns `None` there).
+    pub(crate) cpu_percent_smoothed: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -258,18 +286,12 @@ impl App {
             let _ = config.save(); // first run: materialize the file for users to find
         }
         let device_name = audio::default_input_name().unwrap_or_else(|| "unknown input".into());
-        let calibration = config.calibration.get(&device_name);
-        let tuning = calibration.map(|c| c.tuning()).unwrap_or_default();
-        let calibration_incomplete = calibration_incomplete_for(&config, &device_name);
-        let tuning_meta = TuningMeta {
-            noise_floor_db: tuning.noise_floor_db,
-            quiet_db: tuning.quiet_db,
-            ceiling_db: tuning.ceiling_db,
-            ceiling_confirmed: matches!(
-                calibration.map(|c| c.state),
-                Some(CalibrationState::CeilingSet) | Some(CalibrationState::CeilingLearned)
-            ),
-            sensitivity: tuning.sensitivity,
+        let (tuning_meta, calibration_incomplete) = device_meta(&config, &device_name);
+        let tuning = crate::engine::Tuning {
+            noise_floor_db: tuning_meta.noise_floor_db,
+            quiet_db: tuning_meta.quiet_db,
+            ceiling_db: tuning_meta.ceiling_db,
+            sensitivity: tuning_meta.sensitivity,
         };
 
         let shared = Arc::new(SharedLevels::default());
@@ -394,6 +416,13 @@ impl App {
                 output_devices: Vec::new(),
                 autostart: autostart::autostart_enabled(),
                 autostart_error: None,
+                wizard_error: None,
+                device_changed_note: false,
+                measure_progress_seen: 0.0,
+                measure_stalled_ticks: 0,
+                cpu_sample: None,
+                cpu_epoch: std::time::Instant::now(),
+                cpu_percent_smoothed: 0.0,
             },
             Task::none(), // no window at launch: the app lives in the tray
         )
@@ -471,6 +500,38 @@ impl App {
                 self.latest = self.shared.load();
                 self.today = local_date();
                 self.hour = local_hour();
+
+                // Voiced-measurement stall detection: a `Progress` event
+                // resets `measure_progress_seen`/`measure_stalled_ticks`
+                // (see `Message::Measurement`), so seeing the same progress
+                // again here means no new progress arrived since — the user
+                // isn't being heard.
+                if let Some(wizard) = &self.wizard
+                    && let WizardStep::Measuring { kind, progress } = wizard.step
+                {
+                    if kind == MeasurementKind::NoiseFloor {
+                        self.measure_stalled_ticks = 0;
+                    } else if progress == self.measure_progress_seen {
+                        self.measure_stalled_ticks = self.measure_stalled_ticks.saturating_add(1);
+                    } else {
+                        self.measure_progress_seen = progress;
+                        self.measure_stalled_ticks = 0;
+                    }
+                }
+
+                // CPU readout: only sampled while a window exists (Tick's
+                // own subscription is gated the same way), so this never
+                // costs anything with the app parked in the tray.
+                if let Some(cpu_100ns) = sysinfo::process_cpu_100ns() {
+                    let wall_100ns = (self.cpu_epoch.elapsed().as_nanos() / 100) as u64;
+                    let cur = (cpu_100ns, wall_100ns);
+                    if let Some(prev) = self.cpu_sample {
+                        let pct = sysinfo::cpu_percent(prev, cur);
+                        self.cpu_percent_smoothed = self.cpu_percent_smoothed * 0.7 + pct * 0.3;
+                    }
+                    self.cpu_sample = Some(cur);
+                }
+
                 Task::none()
             }
             Message::SensitivityChanged(value) => {
@@ -523,17 +584,51 @@ impl App {
                     return Task::none();
                 }
                 let event = match update {
-                    MeasurementUpdate::Progress(p) => WizardEvent::Progress(p),
+                    MeasurementUpdate::Progress(p) => {
+                        // Real progress just arrived: the stall clock resets.
+                        self.measure_progress_seen = p;
+                        self.measure_stalled_ticks = 0;
+                        WizardEvent::Progress(p)
+                    }
                     MeasurementUpdate::Complete(kind, db) => WizardEvent::Complete(kind, db),
                 };
                 Task::done(Message::WizardEvent(event))
             }
             Message::WizardStarted => {
+                // No input device means there is nothing to calibrate
+                // against: show the settings window (so the message is
+                // visible) but never actually enter the wizard, which would
+                // just sit measuring a silence that's really "no stream".
+                if !self.has_stream() {
+                    self.wizard_error =
+                        Some("No microphone available — connect one and try again.".into());
+                    return self.open_settings();
+                }
+                self.wizard_error = None;
+
                 // Restarting mid-run must not orphan a measurement in the
                 // audio callback, and must not silently apply a stale
                 // finished result either — restarting is the user choosing
                 // to redo it, not to keep what they had.
                 self.teardown_wizard(false);
+
+                // The default input device can change between launch and
+                // now (a headset plugged in, a USB mic unplugged): re-key
+                // the meter's markers off whatever's current rather than
+                // silently mis-keying against the launch-time device. The
+                // audio stream itself stays on the original device (a full
+                // rebuild is out of scope for v1.0) — the Intro step's note
+                // says so honestly rather than pretending it followed along.
+                let current = audio::default_input_name().unwrap_or_else(|| "unknown input".into());
+                self.device_changed_note = current != self.device_name;
+                if self.device_changed_note {
+                    self.device_name = current;
+                    self.refresh_device_meta();
+                }
+
+                self.measure_progress_seen = 0.0;
+                self.measure_stalled_ticks = 0;
+
                 let _ = self.commands.send(Command::SetWizardActive(true));
                 self.wizard = Some(Wizard::new(local_hour()));
                 // Started from the tray with no window: the wizard has to be
@@ -838,6 +933,28 @@ impl App {
         self.stream.is_some()
     }
 
+    /// Re-derives `tuning_meta`/`calibration_incomplete` for `device_name`
+    /// after `Message::WizardStarted` notices it changed underneath a
+    /// running stream — mirrors `boot`'s computation via the same
+    /// `device_meta` helper so the two never drift apart.
+    fn refresh_device_meta(&mut self) {
+        let (meta, incomplete) = device_meta(&self.config, &self.device_name);
+        self.tuning_meta = meta;
+        self.calibration_incomplete = incomplete;
+    }
+
+    /// Whether the wizard's `Measuring` step should show the "waiting to
+    /// hear your voice" hint under its progress bar — `false` outside a
+    /// voiced `Measuring` step (see `stall_hint_visible`).
+    pub(crate) fn wizard_stall_hint(&self) -> bool {
+        match self.wizard.as_ref().map(|w| &w.step) {
+            Some(WizardStep::Measuring { kind, .. }) => {
+                stall_hint_visible(*kind != MeasurementKind::NoiseFloor, self.measure_stalled_ticks)
+            }
+            _ => false,
+        }
+    }
+
     /// Resolves the currently configured alert sound to samples + rate for a
     /// `PlayRequest`: the built-in cache for `AlertSound::Builtin`, or the
     /// decoded custom buffer for `AlertSound::Custom` — falling back to the
@@ -911,6 +1028,28 @@ fn calibration_from_result(result: &WizardResult, prior_sensitivity: Option<f32>
     }
 }
 
+/// Computes the meter's markers (`TuningMeta`) and the calibration-incomplete
+/// flag for a device from its calibration entry (or lack of one). Shared by
+/// `boot` and `App::refresh_device_meta` (the wizard's device re-read) so a
+/// device swap mid-run can't silently mis-key either one against the wrong
+/// entry.
+fn device_meta(config: &Config, device_name: &str) -> (TuningMeta, bool) {
+    let calibration = config.calibration.get(device_name);
+    let tuning = calibration.map(|c| c.tuning()).unwrap_or_default();
+    let incomplete = calibration_incomplete_for(config, device_name);
+    let meta = TuningMeta {
+        noise_floor_db: tuning.noise_floor_db,
+        quiet_db: tuning.quiet_db,
+        ceiling_db: tuning.ceiling_db,
+        ceiling_confirmed: matches!(
+            calibration.map(|c| c.state),
+            Some(CalibrationState::CeilingSet) | Some(CalibrationState::CeilingLearned)
+        ),
+        sensitivity: tuning.sensitivity,
+    };
+    (meta, incomplete)
+}
+
 /// True when the active device's calibration is missing, `BaselineOnly`, or
 /// degrades to an uncalibrated `Tuning` (e.g. a hand-edited or half-parsed
 /// config entry) — the single source of truth for both the tray's dot icon
@@ -951,6 +1090,15 @@ pub fn banner_visible(incomplete: bool, dismissed_on: Option<&str>, today: &str)
 /// does.
 pub fn drift_nudge_visible(incomplete: bool, drift_db: f32, dismissed: bool) -> bool {
     !incomplete && !dismissed && drift_db.is_finite() && drift_db >= 6.0
+}
+
+/// Whether a voiced (`QuietPoint`/`Ceiling`) measurement's "waiting to hear
+/// your voice" hint should show under the wizard's progress bar: true once
+/// progress has sat still for more than the stall threshold (60 Ticks x
+/// 80 ms ~= 5 s). `NoiseFloor` never shows it — that step wants silence, not
+/// speech, so a stalled 0% there is expected, not a problem.
+pub fn stall_hint_visible(kind_is_voiced: bool, stalled_ticks: u32) -> bool {
+    kind_is_voiced && stalled_ticks > 60
 }
 
 /// Local wall-clock hour (0-23). Only the wizard's late-night default reads
@@ -1249,6 +1397,53 @@ mod tests {
         assert_eq!(SoundChoice::Builtin(BuiltinSound::Chime).to_string(), "Chime");
         assert_eq!(SoundChoice::Custom(None).to_string(), "Custom…");
         assert_eq!(SoundChoice::Custom(Some("ding.wav".to_string())).to_string(), "ding.wav");
+    }
+
+    #[test]
+    fn stall_hint_hidden_for_noise_floor_regardless_of_ticks() {
+        assert!(!stall_hint_visible(false, 0));
+        assert!(!stall_hint_visible(false, 1000));
+    }
+
+    #[test]
+    fn stall_hint_hidden_at_and_below_the_threshold() {
+        assert!(!stall_hint_visible(true, 0));
+        assert!(!stall_hint_visible(true, 60));
+    }
+
+    #[test]
+    fn stall_hint_visible_just_past_the_threshold() {
+        assert!(stall_hint_visible(true, 61));
+        assert!(stall_hint_visible(true, 1000));
+    }
+
+    #[test]
+    fn device_meta_reports_incomplete_with_no_calibration_entry() {
+        let config = Config::default();
+        let (meta, incomplete) = device_meta(&config, "Mic");
+        assert!(incomplete);
+        assert_eq!(meta.quiet_db, None);
+    }
+
+    #[test]
+    fn device_meta_reflects_a_confirmed_ceiling() {
+        let mut config = Config::default();
+        config.calibration.insert(
+            "Mic".into(),
+            DeviceCalibration {
+                state: CalibrationState::CeilingSet,
+                quiet_db: -34.0,
+                ceiling_db: Some(-18.0),
+                noise_floor_db: -58.0,
+                sensitivity: 0.7,
+            },
+        );
+        let (meta, incomplete) = device_meta(&config, "Mic");
+        assert!(!incomplete);
+        assert_eq!(meta.quiet_db, Some(-34.0));
+        assert_eq!(meta.ceiling_db, Some(-18.0));
+        assert!(meta.ceiling_confirmed);
+        assert_eq!(meta.sensitivity, 0.7);
     }
 
     #[test]
