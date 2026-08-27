@@ -1,3 +1,6 @@
+use anyhow::Context;
+use cpal::traits::{DeviceTrait, HostTrait};
+
 use crate::engine::{FRAME_SIZE, SAMPLE_RATE};
 
 /// Converts interleaved device samples into mono FRAME_SIZE frames at SAMPLE_RATE.
@@ -33,6 +36,67 @@ impl FrameBuilder {
             }
         }
     }
+}
+
+/// Opens the default input device and calls `on_frame` with mono 16 kHz frames.
+/// Returns the stream; caller must keep it alive and call .play().
+pub fn start_input(
+    mut on_frame: impl FnMut(&[f32]) + Send + 'static,
+) -> anyhow::Result<cpal::Stream> {
+    let host = cpal::default_host();
+    let device = host
+        .default_input_device()
+        .context("no default input device")?;
+    let config = device
+        .default_input_config()
+        .context("no default input config")?;
+    let mut builder = FrameBuilder::new(config.sample_rate(), config.channels());
+    let err_fn = |e| eprintln!("audio input error: {e}");
+
+    let stream = match config.sample_format() {
+        cpal::SampleFormat::F32 => device.build_input_stream(
+            config.into(),
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                builder.push(data, &mut on_frame);
+            },
+            err_fn,
+            None,
+        )?,
+        cpal::SampleFormat::I16 => {
+            let mut scratch = vec![0.0f32; 4096];
+            device.build_input_stream(
+                config.into(),
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    for chunk in data.chunks(4096) {
+                        for (d, s) in scratch.iter_mut().zip(chunk) {
+                            *d = *s as f32 / 32768.0;
+                        }
+                        builder.push(&scratch[..chunk.len()], &mut on_frame);
+                    }
+                },
+                err_fn,
+                None,
+            )?
+        }
+        cpal::SampleFormat::U16 => {
+            let mut scratch = vec![0.0f32; 4096];
+            device.build_input_stream(
+                config.into(),
+                move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                    for chunk in data.chunks(4096) {
+                        for (d, s) in scratch.iter_mut().zip(chunk) {
+                            *d = (*s as f32 - 32768.0) / 32768.0;
+                        }
+                        builder.push(&scratch[..chunk.len()], &mut on_frame);
+                    }
+                },
+                err_fn,
+                None,
+            )?
+        }
+        other => anyhow::bail!("unsupported sample format {other:?}"),
+    };
+    Ok(stream)
 }
 
 #[cfg(test)]
