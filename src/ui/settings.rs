@@ -6,7 +6,7 @@
 use iced::widget::{button, canvas, column, container, mouse_area, row, slider, space, text, toggler};
 use iced::{Alignment, Element, Length, Theme};
 
-use crate::app::{App, Message};
+use crate::app::{meta_threshold_db, App, Message};
 use crate::detector::TrayState;
 use crate::ui::meter::Meter;
 use crate::ui::theme::{BACKGROUND, FONT_REGULAR, FONT_SEMIBOLD, GREEN, RED, SURFACE, TEXT, TEXT_MUTED, YELLOW};
@@ -86,8 +86,18 @@ fn close_button_style(_theme: &Theme, status: button::Status) -> button::Style {
 /// (`!app.enabled`) shows an empty bar with the markers still visible, since
 /// they're a property of the calibration, not the live signal.
 fn meter_panel(app: &App) -> Element<'_, Message> {
-    let (raw_level_db, threshold_db, raw_peak_db) = app.latest;
-    let (level_db, peak_db) = if app.enabled { (raw_level_db, raw_peak_db) } else { (-100.0, -100.0) };
+    let (raw_level_db, live_threshold_db, raw_peak_db) = app.latest;
+    let live = app.enabled && app.has_stream();
+    let (level_db, peak_db) = if live { (raw_level_db, raw_peak_db) } else { (-100.0, -100.0) };
+    // The audio thread's threshold is only trustworthy while it's actually
+    // live and has published a finite reading; otherwise fall back to what
+    // the calibration anchors alone imply, so the meter never shows a stale
+    // or default (0 dBFS -> permanent red) threshold.
+    let threshold_db = if live && live_threshold_db.is_finite() {
+        live_threshold_db
+    } else {
+        meta_threshold_db(&app.tuning_meta)
+    };
 
     canvas(Meter {
         level_db,
@@ -104,7 +114,12 @@ fn meter_panel(app: &App) -> Element<'_, Message> {
 }
 
 fn status_line(app: &App) -> Element<'_, Message> {
-    let (label, color) = if !app.enabled {
+    // No device outranks Paused/state colors: it's true regardless of the
+    // enabled toggle, and a colored state label over an empty meter would
+    // otherwise claim a reading that doesn't exist.
+    let (label, color) = if !app.has_stream() {
+        ("No microphone", TEXT_MUTED)
+    } else if !app.enabled {
         ("Paused", TEXT_MUTED)
     } else {
         match app.latest_tray_state {
@@ -124,11 +139,13 @@ fn alerts_line(app: &App) -> Element<'_, Message> {
         .into()
 }
 
-/// Sensitivity slider: disabled (a static bar, no interaction) when the
-/// device has no calibration entry at all, since an uncalibrated engine
-/// ignores sensitivity entirely.
+/// Sensitivity slider: disabled (a static bar, no interaction) whenever the
+/// engine ignores sensitivity — which follows `tuning_meta.quiet_db`, not
+/// merely whether a calibration entry exists, since a half-parsed entry
+/// (e.g. a NaN quiet point) still falls back to uncalibrated `Tuning` even
+/// though `config.calibration` has an entry for the device.
 fn sensitivity_block(app: &App) -> Element<'_, Message> {
-    let has_calibration = app.config.calibration.contains_key(&app.device_name);
+    let has_calibration = app.tuning_meta.quiet_db.is_some();
     let label = if app.tuning_meta.ceiling_db.is_none() {
         "Sensitivity (estimated)"
     } else {

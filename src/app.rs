@@ -27,6 +27,11 @@ enum AudioEvent {
 /// `Subscription::run` only accepts a plain `fn` pointer (no captures), so the
 /// receiver built in `boot` is parked here for the subscription's worker thread
 /// to claim exactly once.
+///
+/// This is take-once: safe only as long as `audio_event_subscription()` stays
+/// unconditionally present in `subscription()`'s batch, since a second claim
+/// attempt (e.g. from a subscription that toggles on/off) would find `None`
+/// and silently never receive audio events.
 static AUDIO_EVENTS: Mutex<Option<Receiver<AudioEvent>>> = Mutex::new(None);
 
 /// Menu item ids captured at build time; menu events only carry ids.
@@ -195,7 +200,7 @@ impl App {
                 stream,
                 tuning_meta,
                 icons,
-                latest: (0.0, 0.0, 0.0),
+                latest: (-100.0, f32::NAN, -100.0),
                 latest_tray_state: TrayState::Quiet,
             },
             Task::none(), // no window at launch: the app lives in the tray
@@ -235,6 +240,10 @@ impl App {
             }
             Message::WindowOpened(id) => {
                 self.settings_window = Some(id);
+                // First paint uses whatever the audio thread has actually
+                // published, instead of the boot-time silence sentinel —
+                // avoids a stale reading from before the window existed.
+                self.latest = self.shared.load();
                 round_corners(id)
             }
             Message::WindowClosed(id) => {
@@ -337,8 +346,17 @@ impl App {
             let _ = self.commands.send(Command::SetEnabledIconBaseline);
             if let Some(stream) = &self.stream {
                 let _ = stream.play();
+                // Only claim "quiet" when a stream actually exists to make it
+                // true; with no input device, stay on the off icon rather
+                // than lying that monitoring resumed.
+                let _ = self.tray.set_icon(Some(self.icons.quiet.clone()));
+            } else {
+                let _ = self.tray.set_icon(Some(self.icons.off.clone()));
             }
-            let _ = self.tray.set_icon(Some(self.icons.quiet.clone()));
+            // Drop any stale state from before the toggle (e.g. Loud lingering
+            // across a disable/enable) so the status line doesn't flash a
+            // leftover reading it never re-earned.
+            self.latest_tray_state = TrayState::Quiet;
         } else {
             if let Some(stream) = &self.stream {
                 let _ = stream.pause();
@@ -352,6 +370,26 @@ impl App {
             hold_ms: self.config.hold_ms,
             cooldown_ms: self.config.cooldown_ms,
         });
+    }
+
+    /// Whether an input device is actually open and feeding the detector.
+    /// `false` means the meter/status line must not present live audio data,
+    /// since none exists.
+    pub(crate) fn has_stream(&self) -> bool {
+        self.stream.is_some()
+    }
+}
+
+/// Threshold implied by the calibration anchors alone — what the engine's
+/// `Engine::base_threshold_db` computes from `quiet_db`/`ceiling_db`/
+/// `sensitivity`, with no adaptive drift. Used for the meter whenever the
+/// audio thread isn't publishing a live threshold (paused, no device, window
+/// just opened, or a live threshold that hasn't arrived yet).
+pub fn meta_threshold_db(meta: &TuningMeta) -> f32 {
+    match (meta.quiet_db, meta.ceiling_db) {
+        (Some(q), Some(c)) => q + meta.sensitivity * (c - q),
+        (Some(q), None) => q + 4.0 + 6.0 * meta.sensitivity,
+        (None, _) => f32::NAN,
     }
 }
 
@@ -442,4 +480,31 @@ fn audio_event_subscription() -> Subscription<Message> {
             },
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(quiet_db: Option<f32>, ceiling_db: Option<f32>, sensitivity: f32) -> TuningMeta {
+        TuningMeta { noise_floor_db: -55.0, quiet_db, ceiling_db, ceiling_confirmed: false, sensitivity }
+    }
+
+    #[test]
+    fn meta_threshold_with_confirmed_ceiling_interpolates_between_anchors() {
+        let m = meta(Some(-37.0), Some(-17.0), 0.5);
+        assert!((meta_threshold_db(&m) - (-27.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn meta_threshold_without_ceiling_uses_the_margin_estimate() {
+        let m = meta(Some(-37.0), None, 0.5);
+        assert!((meta_threshold_db(&m) - (-30.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn meta_threshold_uncalibrated_is_nan() {
+        let m = meta(None, None, 0.5);
+        assert!(meta_threshold_db(&m).is_nan());
+    }
 }

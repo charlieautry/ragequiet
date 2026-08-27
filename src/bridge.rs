@@ -2,11 +2,26 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Lock-free per-frame readouts for the meter. Written by the audio callback,
 /// read by the UI at ~12 fps while the settings window is open.
-#[derive(Default)]
 pub struct SharedLevels {
     level_db: AtomicU32,     // f32 bits
     threshold_db: AtomicU32, // f32 bits
     peak_db: AtomicU32,      // f32 bits, decaying ~3 s ghost peak
+}
+
+impl Default for SharedLevels {
+    /// Silence idiom (-100 dBFS) for level/peak, not the bit-pattern-zero
+    /// (0.0 dBFS, i.e. full scale) that `#[derive(Default)]` would give —
+    /// before the audio thread's first store, a fresh load must read as
+    /// silent rather than a full-width red bar. The threshold has no honest
+    /// silent value, so it starts NaN; the meter already guards a non-finite
+    /// threshold as "no threshold yet".
+    fn default() -> Self {
+        Self {
+            level_db: AtomicU32::new((-100.0f32).to_bits()),
+            threshold_db: AtomicU32::new(f32::NAN.to_bits()),
+            peak_db: AtomicU32::new((-100.0f32).to_bits()),
+        }
+    }
 }
 
 impl SharedLevels {
@@ -52,5 +67,16 @@ mod tests {
         let s = SharedLevels::default();
         s.store(-42.5, -30.0, -12.25);
         assert_eq!(s.load(), (-42.5, -30.0, -12.25));
+    }
+
+    #[test]
+    fn shared_levels_default_reads_as_silent_with_no_threshold() {
+        // Before the audio thread's first store, a fresh load must not read
+        // as 0.0 dBFS (full scale) — that would paint a full red bar.
+        let s = SharedLevels::default();
+        let (level_db, threshold_db, peak_db) = s.load();
+        assert_eq!(level_db, -100.0);
+        assert!(threshold_db.is_nan());
+        assert_eq!(peak_db, -100.0);
     }
 }
