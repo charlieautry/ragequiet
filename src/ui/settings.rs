@@ -23,19 +23,30 @@ pub fn cooldown_s_to_ms(seconds: u64) -> u64 {
 }
 
 pub fn view(app: &App) -> Element<'_, Message> {
-    let content = column![
-        chrome_row(),
-        meter_panel(app),
-        status_line(app),
-        alerts_line(app),
-        sensitivity_block(app),
-        hold_block(app),
-        cooldown_block(app),
-        test_mode_row(app),
-        input_line(app),
-    ]
-    .spacing(16)
-    .width(Length::Fill);
+    // The wizard takes over the whole body while it runs (the chrome row
+    // stays, so the window is still movable/closable); the live meter is
+    // handed to it so users watch their own level while calibrating.
+    let body: Element<'_, Message> = match &app.wizard {
+        Some(wizard) => crate::ui::calibrate::view(wizard, meter_panel(app)),
+        None => column![
+            meter_panel(app),
+            status_line(app),
+            alerts_line(app),
+            sensitivity_block(app),
+            hold_block(app),
+            cooldown_block(app),
+            test_mode_row(app),
+            input_line(app),
+        ]
+        .spacing(16)
+        .width(Length::Fill)
+        .into(),
+    };
+
+    let content = column![chrome_row(), body]
+        .spacing(16)
+        .width(Length::Fill)
+        .height(Length::Fill);
 
     container(content)
         .width(Length::Fill)

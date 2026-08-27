@@ -195,6 +195,217 @@ impl Wizard {
     }
 }
 
+// ---------------------------------------------------------------------------
+// View half. Everything above this line is pure (and its tests iced-free);
+// everything below only renders the step above into widgets.
+// ---------------------------------------------------------------------------
+
+use iced::widget::{button, column, progress_bar, row, space, text};
+use iced::{Element, Length, Theme};
+
+use crate::app::Message;
+use crate::ui::theme::{BACKGROUND, FONT_REGULAR, FONT_SEMIBOLD, GREEN, SURFACE, TEXT, TEXT_MUTED};
+
+/// The spec's exact per-step prompts (§5).
+fn instruction(kind: MeasurementKind) -> &'static str {
+    match kind {
+        MeasurementKind::NoiseFloor => "Stay quiet for 3 seconds.",
+        MeasurementKind::QuietPoint => "Talk at the volume you'd use with a roommate asleep.",
+        MeasurementKind::Ceiling => "Talk at the volume you'd use if they were in the room.",
+    }
+}
+
+/// The wizard body, rendered under the settings window's chrome row in place
+/// of the normal controls. `meter` is the same live meter canvas the settings
+/// view builds, passed in so the user watches their own level while
+/// calibrating (and so this stays free of `App`).
+pub fn view<'a>(wizard: &Wizard, meter: Element<'a, Message>) -> Element<'a, Message> {
+    let content: Element<'a, Message> = match &wizard.step {
+        WizardStep::Intro => column![
+            heading("Calibrate for this mic"),
+            body_text(
+                "About 15 seconds: three seconds of silence, then two short voice \
+                 samples. Ragequiet learns what quiet and loud sound like on this \
+                 microphone so it only nudges you when you're actually too loud."
+            ),
+            meter,
+            buttons(vec![primary("Start", Message::WizardEvent(WizardEvent::Begin))]),
+        ]
+        .spacing(16)
+        .into(),
+
+        WizardStep::Measuring { kind, progress } => column![
+            heading(instruction(*kind)),
+            // `girth` is iced 0.14's cross-axis size for the bar (`height`
+            // on a horizontal one); `height` itself is not public here.
+            progress_bar(0.0..=1.0, *progress).girth(Length::Fixed(8.0)),
+            meter,
+        ]
+        .spacing(16)
+        .into(),
+
+        WizardStep::NoiseDone { noise_db } => column![
+            heading(format!("Noise floor: {noise_db:.0} dB")),
+            body_text("That's the room with nobody talking. Next: your quiet voice."),
+            meter,
+            buttons(vec![primary(
+                "Continue",
+                Message::WizardEvent(WizardEvent::Continue)
+            )]),
+        ]
+        .spacing(16)
+        .into(),
+
+        WizardStep::QuietDone { quiet_db, skip_ceiling_default, .. } => {
+            let measure = || primary("Measure loud point", Message::WizardEvent(WizardEvent::Continue));
+            let measure_secondary =
+                || secondary("Measure loud point", Message::WizardEvent(WizardEvent::Continue));
+            let mut block = column![heading(format!("Quiet point set: {quiet_db:.0} dB"))].spacing(16);
+            // Late at night the loud step is the wrong thing to ask for, so
+            // skipping leads and gets the explanation.
+            if *skip_ceiling_default {
+                block = block
+                    .push(body_text(
+                        "It's late — skip the loud step and finish it tomorrow. \
+                         Detection still works meanwhile.",
+                    ))
+                    .push(meter)
+                    .push(buttons(vec![
+                        primary("Skip for now", Message::WizardEvent(WizardEvent::SkipCeiling)),
+                        measure_secondary(),
+                    ]));
+            } else {
+                block = block
+                    .push(body_text(
+                        "One more: how loud you'd be with company around. \
+                         This sets the top of the range.",
+                    ))
+                    .push(meter)
+                    .push(buttons(vec![
+                        measure(),
+                        secondary("Skip", Message::WizardEvent(WizardEvent::SkipCeiling)),
+                    ]));
+            }
+            block.into()
+        }
+
+        WizardStep::CeilingRetry { gap_db, .. } => column![
+            heading("That wasn't loud enough to tell apart"),
+            body_text(format!(
+                "That was within {gap_db:.0} dB of your quiet voice — either not loud \
+                 enough, or your mic's gain is limiting. Try again?"
+            )),
+            meter,
+            buttons(vec![
+                primary("Retry", Message::WizardEvent(WizardEvent::Continue)),
+                secondary("Skip", Message::WizardEvent(WizardEvent::SkipCeiling)),
+            ]),
+        ]
+        .spacing(16)
+        .into(),
+
+        WizardStep::Done { result } => {
+            let ceiling = match result.ceiling_db {
+                Some(c) => format!("Loud point: {c:.0} dB"),
+                None => "Loud point: estimated (skipped)".to_string(),
+            };
+            column![
+                heading("Calibration saved"),
+                body_text(format!("Quiet point: {:.0} dB", result.quiet_db)),
+                body_text(ceiling),
+                meter,
+                buttons(vec![primary("Finish", Message::WizardFinished)]),
+            ]
+            .spacing(16)
+            .into()
+        }
+    };
+
+    column![content, space::vertical(), cancel_row()]
+        .spacing(16)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
+}
+
+fn heading<'a>(label: impl Into<String>) -> Element<'a, Message> {
+    text(label.into()).font(FONT_SEMIBOLD).size(20).color(TEXT).into()
+}
+
+fn body_text<'a>(label: impl Into<String>) -> Element<'a, Message> {
+    text(label.into()).font(FONT_REGULAR).size(13).color(TEXT_MUTED).into()
+}
+
+fn buttons<'a>(items: Vec<Element<'a, Message>>) -> Element<'a, Message> {
+    row(items).spacing(8).width(Length::Fill).into()
+}
+
+/// Always available: leaving the wizard cancels any in-flight measurement and
+/// drops back to the normal settings view.
+fn cancel_row<'a>() -> Element<'a, Message> {
+    row![
+        space::horizontal(),
+        button(text("Cancel").font(FONT_REGULAR).size(13))
+            .padding([6.0, 12.0])
+            .style(muted_button_style)
+            .on_press(Message::WizardCancelled),
+    ]
+    .width(Length::Fill)
+    .into()
+}
+
+fn primary<'a>(label: impl Into<String>, message: Message) -> Element<'a, Message> {
+    button(text(label.into()).font(FONT_SEMIBOLD).size(13))
+        .padding([8.0, 16.0])
+        .style(primary_button_style)
+        .on_press(message)
+        .into()
+}
+
+fn secondary<'a>(label: impl Into<String>, message: Message) -> Element<'a, Message> {
+    button(text(label.into()).font(FONT_REGULAR).size(13))
+        .padding([8.0, 16.0])
+        .style(secondary_button_style)
+        .on_press(message)
+        .into()
+}
+
+fn primary_button_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let mut background = GREEN;
+    if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        background.a = 0.85;
+    }
+    button::Style {
+        background: Some(background.into()),
+        text_color: BACKGROUND, // dark ink on the green fill
+        border: iced::border::rounded(6.0),
+        ..button::Style::default()
+    }
+}
+
+fn secondary_button_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let text_color = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        TEXT
+    } else {
+        TEXT_MUTED
+    };
+    button::Style {
+        background: Some(SURFACE.into()),
+        text_color,
+        border: iced::border::rounded(6.0),
+        ..button::Style::default()
+    }
+}
+
+fn muted_button_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let text_color = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        TEXT
+    } else {
+        TEXT_MUTED
+    };
+    button::Style { text_color, ..button::Style::default() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

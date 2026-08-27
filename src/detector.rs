@@ -26,9 +26,7 @@ pub struct FrameOutcome {
     pub state_change: Option<TrayState>,
     pub beep: bool,
     /// Some(..) only on a progress-percent change or on completion of an
-    /// active calibration measurement. Read from app.rs starting with the
-    /// calibration wizard (Phase 2c Task 2/3); until then only tests read it.
-    #[allow(dead_code)]
+    /// active calibration measurement; app.rs forwards it to the wizard.
     pub measurement: Option<MeasurementUpdate>,
 }
 
@@ -180,7 +178,6 @@ impl Detector {
 /// allocates: sample buffers + a realfft planner) and handed through
 /// `Command::StartMeasurement` pre-built, so the audio callback's command
 /// drain in `apply` never allocates.
-#[allow(dead_code)] // called from app.rs starting with the calibration wizard (Phase 2c Task 2/3)
 pub fn measurement_for(kind: MeasurementKind) -> Measurement {
     match kind {
         MeasurementKind::NoiseFloor => Measurement::noise_floor(),

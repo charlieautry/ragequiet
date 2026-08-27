@@ -42,10 +42,6 @@ impl SharedLevels {
 
 /// Which calibration step is being measured; drives which `Measurement`
 /// constructor the detector uses and what completion event flows back.
-// Constructed from app.rs once the calibration wizard (Phase 2c Task 2/3)
-// sends `Command::StartMeasurement`; until then only the detector's own
-// tests build these.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeasurementKind {
     NoiseFloor,
@@ -62,13 +58,11 @@ pub enum Command {
     SetGate { hold_ms: u64, cooldown_ms: u64 },
     SetTestMode(bool),
     SetEnabledIconBaseline, // resume(): re-announce color after enable toggle
-    // Sent from app.rs starting with the calibration wizard (Phase 2c Task 2/3).
-    // The `Measurement` is built on the UI thread (it allocates: sample
-    // buffers + a realfft planner) and handed through pre-built so the audio
-    // callback's command drain never allocates.
-    #[allow(dead_code)]
+    // Sent from app.rs by the calibration wizard. The `Measurement` is built
+    // on the UI thread (it allocates: sample buffers + a realfft planner) and
+    // handed through pre-built so the audio callback's command drain never
+    // allocates.
     StartMeasurement(MeasurementKind, Box<crate::engine::calibrate::Measurement>),
-    #[allow(dead_code)]
     CancelMeasurement,
 }
 

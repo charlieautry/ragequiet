@@ -11,10 +11,11 @@ use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::alert::AlertGate;
 use crate::bridge::{self, Command, CommandTx, SharedLevels};
-use crate::config::{CalibrationState, Config};
-use crate::detector::{Detector, TrayState};
+use crate::config::{CalibrationState, Config, DeviceCalibration};
+use crate::detector::{Detector, MeasurementUpdate, TrayState};
 use crate::engine::Engine;
 use crate::ui;
+use crate::ui::calibrate::{Wizard, WizardEvent, WizardResult, WizardStep};
 use crate::ui::icons::TrayIcons;
 use crate::{alert, audio};
 
@@ -22,6 +23,10 @@ use crate::{alert, audio};
 enum AudioEvent {
     State(TrayState),
     Beeped,
+    /// Progress/completion of a calibration measurement running inside the
+    /// callback. Rare by construction: whole-percent changes only, and only
+    /// while the wizard has one in flight.
+    Measurement(MeasurementUpdate),
 }
 
 /// `Subscription::run` only accepts a plain `fn` pointer (no captures), so the
@@ -37,6 +42,7 @@ static AUDIO_EVENTS: Mutex<Option<Receiver<AudioEvent>>> = Mutex::new(None);
 /// Menu item ids captured at build time; menu events only carry ids.
 struct MenuIds {
     enabled: MenuId,
+    recalibrate: MenuId,
     settings: MenuId,
     quit: MenuId,
 }
@@ -72,6 +78,8 @@ pub struct App {
     pub(crate) latest: (f32, f32, f32),
     /// Last tray state seen, for the settings window's status line.
     pub(crate) latest_tray_state: TrayState,
+    /// Some while the calibration wizard owns the settings window's body.
+    pub(crate) wizard: Option<Wizard>,
     /// True once a `*Changed` message has edited `config` since the last save
     /// (slider release, or a non-drag edit like Ctrl+scroll/arrow keys that
     /// never fires `on_release`); `commit_config` is the only place this is
@@ -100,6 +108,18 @@ pub enum Message {
     /// persisted to disk (the per-tick `*Changed` messages only push the live
     /// `Command` so the engine reacts immediately, without hammering disk).
     SettingsCommitted,
+    /// A calibration measurement update straight off the audio thread; routed
+    /// into the wizard by `update` (and dropped when no wizard is running).
+    Measurement(MeasurementUpdate),
+    /// Enter the wizard (tray "Recalibrate"), opening the window if needed.
+    WizardStarted,
+    /// A wizard-state-machine transition: button presses (Begin/Continue/
+    /// SkipCeiling) and audio-driven Progress/Complete alike.
+    WizardEvent(WizardEvent),
+    /// Leave the wizard, cancelling any in-flight measurement.
+    WizardCancelled,
+    /// Accept the finished result: persist it and apply it live.
+    WizardFinished,
     Quit,
 }
 
@@ -153,6 +173,9 @@ impl App {
             if let Some(state) = outcome.state_change {
                 let _ = events.send(AudioEvent::State(state));
             }
+            if let Some(update) = outcome.measurement {
+                let _ = events.send(AudioEvent::Measurement(update));
+            }
         })
         .ok();
         if let Some(stream) = &stream {
@@ -160,16 +183,19 @@ impl App {
         }
 
         let enabled_item = CheckMenuItem::new("Enabled", true, true, None);
+        let recalibrate_item = MenuItem::new("Recalibrate", true, None);
         let settings_item = MenuItem::new("Settings", true, None);
         let quit_item = MenuItem::new("Quit", true, None);
         let menu_ids = MenuIds {
             enabled: enabled_item.id().clone(),
+            recalibrate: recalibrate_item.id().clone(),
             settings: settings_item.id().clone(),
             quit: quit_item.id().clone(),
         };
         let menu = Menu::new();
         let _ = menu.append_items(&[
             &enabled_item,
+            &recalibrate_item,
             &settings_item,
             &PredefinedMenuItem::separator(),
             &quit_item,
@@ -207,6 +233,7 @@ impl App {
                 icons,
                 latest: (-100.0, f32::NAN, -100.0),
                 latest_tray_state: TrayState::Quiet,
+                wizard: None,
                 config_dirty: false,
             },
             Task::none(), // no window at launch: the app lives in the tray
@@ -226,6 +253,8 @@ impl App {
             Message::MenuEvent(id) => {
                 if id == self.menu_ids.enabled {
                     self.set_enabled(self.enabled_item.is_checked());
+                } else if id == self.menu_ids.recalibrate {
+                    return Task::done(Message::WizardStarted);
                 } else if id == self.menu_ids.settings {
                     return self.open_settings();
                 } else if id == self.menu_ids.quit {
@@ -255,6 +284,9 @@ impl App {
             Message::WindowClosed(id) => {
                 if self.settings_window == Some(id) {
                     self.settings_window = None;
+                    // The wizard lives in this window: closing it is a cancel,
+                    // otherwise a measurement would keep running headless.
+                    self.cancel_wizard();
                 }
                 self.commit_config();
                 Task::none()
@@ -304,6 +336,55 @@ impl App {
             },
             Message::SettingsCommitted => {
                 self.commit_config();
+                Task::none()
+            }
+            Message::Measurement(update) => {
+                // No wizard means this is a straggler from a cancelled run:
+                // drop it rather than let it reach the state machine.
+                if self.wizard.is_none() {
+                    return Task::none();
+                }
+                let event = match update {
+                    MeasurementUpdate::Progress(p) => WizardEvent::Progress(p),
+                    MeasurementUpdate::Complete(kind, db) => WizardEvent::Complete(kind, db),
+                };
+                Task::done(Message::WizardEvent(event))
+            }
+            Message::WizardStarted => {
+                // Restarting mid-run must not orphan a measurement in the
+                // audio callback.
+                self.cancel_wizard();
+                self.wizard = Some(Wizard::new(local_hour()));
+                // Started from the tray with no window: the wizard has to be
+                // visible to be usable, so open one (no-op if already open).
+                self.open_settings()
+            }
+            Message::WizardEvent(event) => {
+                if let Some(wizard) = self.wizard.as_mut()
+                    && let Some(kind) = wizard.on_event(event)
+                {
+                    // The `Measurement` is allocated here, on the UI thread —
+                    // the audio callback only installs the finished value.
+                    let measurement = crate::detector::measurement_for(kind);
+                    let _ = self
+                        .commands
+                        .send(Command::StartMeasurement(kind, Box::new(measurement)));
+                }
+                Task::none()
+            }
+            Message::WizardCancelled => {
+                self.cancel_wizard();
+                Task::none()
+            }
+            Message::WizardFinished => {
+                let result = match self.wizard.as_ref().map(|w| &w.step) {
+                    Some(WizardStep::Done { result }) => Some(*result),
+                    _ => None, // only a finished wizard has anything to apply
+                };
+                if let Some(result) = result {
+                    self.apply_calibration(result);
+                    self.wizard = None;
+                }
                 Task::none()
             }
             Message::Quit => {
@@ -378,6 +459,47 @@ impl App {
         }
     }
 
+    /// Drop the wizard, telling the audio thread to abandon any measurement it
+    /// is still accumulating. Safe to call with no wizard running.
+    fn cancel_wizard(&mut self) {
+        if let Some(wizard) = self.wizard.take()
+            && wizard.cancelled_measurement().is_some()
+        {
+            let _ = self.commands.send(Command::CancelMeasurement);
+        }
+    }
+
+    /// Persist a finished calibration and make it live: config write, engine
+    /// retune, and a `tuning_meta` refresh so the meter's markers and the
+    /// sensitivity slider's gating are correct on the very next paint — no
+    /// restart.
+    fn apply_calibration(&mut self, result: WizardResult) {
+        let prior_sensitivity = self
+            .config
+            .calibration
+            .get(&self.device_name)
+            .map(|c| c.sensitivity);
+        let entry = calibration_from_result(&result, prior_sensitivity);
+
+        // Round-trip through `tuning()` exactly as boot does, so a nonsense
+        // measurement degrades the same way a hand-edited config would.
+        let tuning = entry.tuning();
+        self.tuning_meta = TuningMeta {
+            noise_floor_db: tuning.noise_floor_db,
+            quiet_db: tuning.quiet_db,
+            ceiling_db: tuning.ceiling_db,
+            ceiling_confirmed: entry.state != CalibrationState::BaselineOnly,
+            sensitivity: tuning.sensitivity,
+        };
+        let _ = self.commands.send(Command::SetTuning(tuning));
+
+        self.config.calibration.insert(self.device_name.clone(), entry);
+        // Written straight through rather than via the dirty/commit flow: a
+        // finished calibration must survive even if the app never reaches a
+        // commit point.
+        let _ = self.config.save();
+    }
+
     fn send_gate(&mut self) {
         let _ = self.commands.send(Command::SetGate {
             hold_ms: self.config.hold_ms,
@@ -416,6 +538,46 @@ pub fn meta_threshold_db(meta: &TuningMeta) -> f32 {
         (Some(q), None) => q + 4.0 + 6.0 * meta.sensitivity,
         (None, _) => f32::NAN,
     }
+}
+
+/// Pure core of [`App::apply_calibration`]: the wizard's three numbers plus
+/// whatever sensitivity the device already had become a persistable entry.
+/// A measured ceiling is what separates `CeilingSet` from `BaselineOnly`
+/// (the engine estimates a margin for the latter).
+fn calibration_from_result(result: &WizardResult, prior_sensitivity: Option<f32>) -> DeviceCalibration {
+    DeviceCalibration {
+        state: if result.ceiling_db.is_some() {
+            CalibrationState::CeilingSet
+        } else {
+            CalibrationState::BaselineOnly
+        },
+        quiet_db: result.quiet_db,
+        ceiling_db: result.ceiling_db,
+        noise_floor_db: result.noise_floor_db,
+        // Recalibrating re-measures the anchors, not the user's taste: an
+        // existing sensitivity preference survives.
+        sensitivity: prior_sensitivity.unwrap_or(0.5),
+    }
+}
+
+/// Local wall-clock hour (0-23). Only the wizard's late-night default reads
+/// it, and it takes the hour as a parameter, so this stays a leaf function
+/// with no pure logic inside it.
+#[cfg(windows)]
+fn local_hour() -> u32 {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    let mut now = SYSTEMTIME::default();
+    // SAFETY: `GetLocalTime` only writes a full `SYSTEMTIME` through the
+    // pointer we own here; it cannot fail.
+    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&raw mut now) };
+    u32::from(now.wHour)
+}
+
+/// Midday: on non-Windows targets there is no tray app anyway, and midday is
+/// the hour that disables the late-night skip default.
+#[cfg(not(windows))]
+fn local_hour() -> u32 {
+    12
 }
 
 /// Best-effort Windows 11 rounded corners for the borderless settings window
@@ -493,6 +655,7 @@ fn audio_event_subscription() -> Subscription<Message> {
                             let message = match event {
                                 AudioEvent::State(state) => Message::TrayStateChanged(state),
                                 AudioEvent::Beeped => Message::Beeped,
+                                AudioEvent::Measurement(update) => Message::Measurement(update),
                             };
                             if futures::executor::block_on(output.send(message)).is_err() {
                                 break;
@@ -531,5 +694,38 @@ mod tests {
     fn meta_threshold_uncalibrated_is_nan() {
         let m = meta(None, None, 0.5);
         assert!(meta_threshold_db(&m).is_nan());
+    }
+
+    fn result(ceiling_db: Option<f32>) -> WizardResult {
+        WizardResult { noise_floor_db: -58.0, quiet_db: -34.0, ceiling_db }
+    }
+
+    #[test]
+    fn measured_ceiling_yields_ceiling_set() {
+        let cal = calibration_from_result(&result(Some(-18.0)), None);
+        assert_eq!(cal.state, CalibrationState::CeilingSet);
+        assert_eq!(cal.quiet_db, -34.0);
+        assert_eq!(cal.ceiling_db, Some(-18.0));
+        assert_eq!(cal.noise_floor_db, -58.0);
+    }
+
+    #[test]
+    fn skipped_ceiling_yields_baseline_only() {
+        let cal = calibration_from_result(&result(None), None);
+        assert_eq!(cal.state, CalibrationState::BaselineOnly);
+        assert_eq!(cal.ceiling_db, None);
+        assert_eq!(cal.quiet_db, -34.0);
+    }
+
+    #[test]
+    fn existing_sensitivity_survives_recalibration() {
+        let cal = calibration_from_result(&result(Some(-18.0)), Some(0.8));
+        assert_eq!(cal.sensitivity, 0.8);
+    }
+
+    #[test]
+    fn first_calibration_defaults_sensitivity_to_half() {
+        let cal = calibration_from_result(&result(Some(-18.0)), None);
+        assert_eq!(cal.sensitivity, 0.5);
     }
 }
