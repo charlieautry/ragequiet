@@ -6,10 +6,30 @@
 use iced::widget::{button, canvas, column, container, mouse_area, row, slider, space, text, toggler};
 use iced::{Alignment, Element, Length, Theme};
 
-use crate::app::{meta_threshold_db, App, Message};
+use crate::app::{banner_visible, drift_nudge_visible, meta_threshold_db, App, Message};
 use crate::detector::TrayState;
 use crate::ui::meter::Meter;
 use crate::ui::theme::{BACKGROUND, FONT_REGULAR, FONT_SEMIBOLD, GREEN, RED, SURFACE, TEXT, TEXT_MUTED, YELLOW};
+
+/// Which reminder banner (if any) should show. Only one shows at a time: the
+/// calibration-incomplete banner wins over the drift nudge whenever both
+/// would otherwise be visible.
+enum Banner {
+    /// Calibration incomplete; `urgent` picks the opportunistic daytime copy.
+    Incomplete { urgent: bool },
+    Drift,
+}
+
+fn active_banner(app: &App) -> Option<Banner> {
+    if banner_visible(app.calibration_incomplete, app.config.banner_dismissed_on.as_deref(), &app.today) {
+        let urgent = app.alerts_this_session > 0 && (7..=21).contains(&app.hour);
+        Some(Banner::Incomplete { urgent })
+    } else if drift_nudge_visible(app.calibration_incomplete, app.latest.3, app.drift_nudge_dismissed) {
+        Some(Banner::Drift)
+    } else {
+        None
+    }
+}
 
 /// Seconds shown/edited by the cooldown slider; the config field stays in ms.
 pub fn cooldown_ms_to_s(cooldown_ms: u64) -> u64 {
@@ -28,19 +48,21 @@ pub fn view(app: &App) -> Element<'_, Message> {
     // handed to it so users watch their own level while calibrating.
     let body: Element<'_, Message> = match &app.wizard {
         Some(wizard) => crate::ui::calibrate::view(wizard, meter_panel(app)),
-        None => column![
-            meter_panel(app),
-            status_line(app),
-            alerts_line(app),
-            sensitivity_block(app),
-            hold_block(app),
-            cooldown_block(app),
-            test_mode_row(app),
-            input_line(app),
-        ]
-        .spacing(16)
-        .width(Length::Fill)
-        .into(),
+        None => {
+            let mut col = column![].spacing(16).width(Length::Fill);
+            if let Some(banner) = banner_row(app) {
+                col = col.push(banner);
+            }
+            col.push(meter_panel(app))
+                .push(status_line(app))
+                .push(alerts_line(app))
+                .push(sensitivity_block(app))
+                .push(hold_block(app))
+                .push(cooldown_block(app))
+                .push(test_mode_row(app))
+                .push(input_line(app))
+                .into()
+        }
     };
 
     let content = column![chrome_row(), body]
@@ -82,6 +104,69 @@ fn chrome_row<'a>() -> Element<'a, Message> {
         .into()
 }
 
+/// A one-line dismissible reminder at the top of the controls view: never
+/// shown while the wizard is running, and never more than one at a time (the
+/// calibration-incomplete banner wins over the drift nudge — see
+/// `active_banner`).
+fn banner_row(app: &App) -> Option<Element<'_, Message>> {
+    let (message, action_label, action, dismiss): (&str, &str, Message, Message) = match active_banner(app)? {
+        Banner::Incomplete { urgent: true } => (
+            "Sounds like you're free to be loud right now. Finish calibration? (5 seconds)",
+            "Calibrate",
+            Message::WizardStarted,
+            Message::BannerDismissed,
+        ),
+        Banner::Incomplete { urgent: false } => (
+            "Calibration incomplete. Finish the loud step for the most accurate detection.",
+            "Calibrate",
+            Message::WizardStarted,
+            Message::BannerDismissed,
+        ),
+        Banner::Drift => (
+            "Your mic level has shifted since calibration — recalibrate? (takes ~15 s)",
+            "Recalibrate",
+            Message::WizardStarted,
+            Message::DriftNudgeDismissed,
+        ),
+    };
+
+    let content = row![
+        text(message).font(FONT_REGULAR).size(12).color(TEXT).width(Length::Fill),
+        button(text(action_label).font(FONT_SEMIBOLD).size(12))
+            .padding([4.0, 10.0])
+            .style(banner_action_style)
+            .on_press(action),
+        button(text("✕").size(12)).padding([2.0, 8.0]).style(close_button_style).on_press(dismiss),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    Some(
+        container(content)
+            .width(Length::Fill)
+            .padding(10)
+            .style(|_theme: &Theme| container::Style {
+                background: Some(SURFACE.into()),
+                border: iced::border::rounded(8.0),
+                ..container::Style::default()
+            })
+            .into(),
+    )
+}
+
+fn banner_action_style(_theme: &Theme, status: button::Status) -> button::Style {
+    let mut background = GREEN;
+    if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        background.a = 0.85;
+    }
+    button::Style {
+        background: Some(background.into()),
+        text_color: BACKGROUND,
+        border: iced::border::rounded(6.0),
+        ..button::Style::default()
+    }
+}
+
 fn close_button_style(_theme: &Theme, status: button::Status) -> button::Style {
     let text_color = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
         RED
@@ -97,7 +182,7 @@ fn close_button_style(_theme: &Theme, status: button::Status) -> button::Style {
 /// (`!app.enabled`) shows an empty bar with the markers still visible, since
 /// they're a property of the calibration, not the live signal.
 fn meter_panel(app: &App) -> Element<'_, Message> {
-    let (raw_level_db, live_threshold_db, raw_peak_db) = app.latest;
+    let (raw_level_db, live_threshold_db, raw_peak_db, _drift_db) = app.latest;
     let live = app.enabled && app.has_stream();
     let (level_db, peak_db) = if live { (raw_level_db, raw_peak_db) } else { (-100.0, -100.0) };
     // The audio thread's threshold is only trustworthy while it's actually

@@ -43,11 +43,21 @@ pub struct Config {
     pub cooldown_ms: u64,
     /// Keyed by input device name; each device calibrates separately.
     pub calibration: BTreeMap<String, DeviceCalibration>,
+    /// ISO date ("2026-08-27") the calibration-incomplete banner was last
+    /// dismissed; `None` before the first dismissal. Compared against
+    /// today's date so the banner reappears once per day.
+    #[serde(default)]
+    pub banner_dismissed_on: Option<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Self { hold_ms: 300, cooldown_ms: 3000, calibration: BTreeMap::new() }
+        Self {
+            hold_ms: 300,
+            cooldown_ms: 3000,
+            calibration: BTreeMap::new(),
+            banner_dismissed_on: None,
+        }
     }
 }
 
@@ -86,12 +96,18 @@ struct RawConfig {
     hold_ms: u64,
     cooldown_ms: u64,
     calibration: BTreeMap<String, toml::Value>,
+    banner_dismissed_on: Option<String>,
 }
 
 impl Default for RawConfig {
     fn default() -> Self {
         let d = Config::default();
-        Self { hold_ms: d.hold_ms, cooldown_ms: d.cooldown_ms, calibration: BTreeMap::new() }
+        Self {
+            hold_ms: d.hold_ms,
+            cooldown_ms: d.cooldown_ms,
+            calibration: BTreeMap::new(),
+            banner_dismissed_on: None,
+        }
     }
 }
 
@@ -105,7 +121,12 @@ impl RawConfig {
                 (name, cal)
             })
             .collect();
-        Config { hold_ms: self.hold_ms, cooldown_ms: self.cooldown_ms, calibration }
+        Config {
+            hold_ms: self.hold_ms,
+            cooldown_ms: self.cooldown_ms,
+            calibration,
+            banner_dismissed_on: self.banner_dismissed_on,
+        }
     }
 }
 
@@ -171,6 +192,18 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "not [valid toml ((").unwrap();
         assert_eq!(Config::load_from(&path), Config::default());
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn round_trips_banner_dismissed_on() {
+        let path = temp_config_path("banner");
+        let cfg = Config {
+            banner_dismissed_on: Some("2026-08-27".to_string()),
+            ..Config::default()
+        };
+        cfg.save_to(&path).unwrap();
+        assert_eq!(Config::load_from(&path), cfg);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

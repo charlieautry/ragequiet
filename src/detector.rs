@@ -155,6 +155,13 @@ impl Detector {
         self.peak_db
     }
 
+    /// Baseline drift since calibration (dB); NaN when uncalibrated. Cheap:
+    /// it reads a value the engine already cached while computing this
+    /// frame's threshold, rather than running a second median.
+    pub fn drift_db(&self) -> f32 {
+        self.engine.baseline_drift_db()
+    }
+
     /// Apply a UI command in the audio callback, between frames.
     pub fn apply(&mut self, cmd: crate::bridge::Command) {
         use crate::bridge::Command;

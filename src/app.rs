@@ -16,7 +16,7 @@ use crate::detector::{Detector, MeasurementUpdate, TrayState};
 use crate::engine::Engine;
 use crate::ui;
 use crate::ui::calibrate::{Wizard, WizardEvent, WizardResult, WizardStep};
-use crate::ui::icons::TrayIcons;
+use crate::ui::icons::{TrayIconSets, TrayIcons};
 use crate::{alert, audio};
 
 /// Rare events pushed from the audio callback to the UI.
@@ -73,9 +73,10 @@ pub struct App {
     /// None when the input device could not be opened; the app still runs.
     stream: Option<cpal::Stream>,
     pub(crate) tuning_meta: TuningMeta,
-    icons: TrayIcons,
-    /// (level_db, threshold_db, peak_db) sampled on Tick so `view` stays pure.
-    pub(crate) latest: (f32, f32, f32),
+    icons: TrayIconSets,
+    /// (level_db, threshold_db, peak_db, drift_db) sampled on Tick so `view`
+    /// stays pure.
+    pub(crate) latest: (f32, f32, f32, f32),
     /// Last tray state seen, for the settings window's status line.
     pub(crate) latest_tray_state: TrayState,
     /// Some while the calibration wizard owns the settings window's body.
@@ -85,6 +86,19 @@ pub struct App {
     /// never fires `on_release`); `commit_config` is the only place this is
     /// cleared.
     config_dirty: bool,
+    /// True when the active device's calibration is missing, `BaselineOnly`,
+    /// or degrades to uncalibrated `Tuning` — drives both the tray's dot icon
+    /// and the settings banner. Recomputed at boot and after
+    /// `apply_calibration`.
+    pub(crate) calibration_incomplete: bool,
+    /// Today's local date ("YYYY-MM-DD"), cached on `Tick`/`WindowOpened` so
+    /// `view` never needs a syscall.
+    pub(crate) today: String,
+    /// Local wall-clock hour (0-23), cached the same way as `today`.
+    pub(crate) hour: u32,
+    /// Session-only dismissal of the drift-staleness nudge; never resets
+    /// (unlike the once-per-day banner, which tracks a date).
+    pub(crate) drift_nudge_dismissed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +134,11 @@ pub enum Message {
     WizardCancelled,
     /// Accept the finished result: persist it and apply it live.
     WizardFinished,
+    /// Dismiss the once-per-day calibration-incomplete banner: records
+    /// today's date so it stays hidden until tomorrow.
+    BannerDismissed,
+    /// Dismiss the drift-staleness nudge for this session only.
+    DriftNudgeDismissed,
     Quit,
 }
 
@@ -134,6 +153,7 @@ impl App {
         let device_name = audio::default_input_name().unwrap_or_else(|| "unknown input".into());
         let calibration = config.calibration.get(&device_name);
         let tuning = calibration.map(|c| c.tuning()).unwrap_or_default();
+        let calibration_incomplete = calibration_incomplete_for(&config, &device_name);
         let tuning_meta = TuningMeta {
             noise_floor_db: tuning.noise_floor_db,
             quiet_db: tuning.quiet_db,
@@ -165,7 +185,12 @@ impl App {
             let now_ms = start.elapsed().as_millis() as u64;
             let outcome = detector.on_frame(frame, now_ms);
             let threshold_db = detector.threshold_db();
-            callback_shared.store(detector.last_level_db(), threshold_db, detector.peak_db());
+            callback_shared.store(
+                detector.last_level_db(),
+                threshold_db,
+                detector.peak_db(),
+                detector.drift_db(),
+            );
             if outcome.beep {
                 alert::play_beep();
                 let _ = events.send(AudioEvent::Beeped);
@@ -201,12 +226,13 @@ impl App {
             &quit_item,
         ]);
 
-        let icons = TrayIcons::load();
+        let icons = TrayIconSets::load();
+        let initial_icon_set = if calibration_incomplete { &icons.dotted } else { &icons.plain };
         // No stream means nothing is being monitored: say so with the off icon.
         let initial_icon = if stream.is_some() {
-            icons.quiet.clone()
+            initial_icon_set.quiet.clone()
         } else {
-            icons.off.clone()
+            initial_icon_set.off.clone()
         };
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -231,10 +257,14 @@ impl App {
                 stream,
                 tuning_meta,
                 icons,
-                latest: (-100.0, f32::NAN, -100.0),
+                latest: (-100.0, f32::NAN, -100.0, f32::NAN),
                 latest_tray_state: TrayState::Quiet,
                 wizard: None,
                 config_dirty: false,
+                calibration_incomplete,
+                today: local_date(),
+                hour: local_hour(),
+                drift_nudge_dismissed: false,
             },
             Task::none(), // no window at launch: the app lives in the tray
         )
@@ -265,7 +295,7 @@ impl App {
             Message::TrayStateChanged(state) => {
                 self.latest_tray_state = state;
                 if self.enabled {
-                    let _ = self.tray.set_icon(Some(self.icons.for_state(state)));
+                    let _ = self.tray.set_icon(Some(self.active_icons().for_state(state)));
                 }
                 Task::none()
             }
@@ -279,6 +309,8 @@ impl App {
                 // published, instead of the boot-time silence sentinel —
                 // avoids a stale reading from before the window existed.
                 self.latest = self.shared.load();
+                self.today = local_date();
+                self.hour = local_hour();
                 round_corners(id)
             }
             Message::WindowClosed(id) => {
@@ -293,6 +325,8 @@ impl App {
             }
             Message::Tick => {
                 self.latest = self.shared.load();
+                self.today = local_date();
+                self.hour = local_hour();
                 Task::none()
             }
             Message::SensitivityChanged(value) => {
@@ -387,6 +421,17 @@ impl App {
                 }
                 Task::none()
             }
+            Message::BannerDismissed => {
+                self.config.banner_dismissed_on = Some(local_date());
+                // Direct save, like `apply_calibration`: a dismissal must
+                // survive even if the app never reaches a commit point.
+                let _ = self.config.save();
+                Task::none()
+            }
+            Message::DriftNudgeDismissed => {
+                self.drift_nudge_dismissed = true;
+                Task::none()
+            }
             Message::Quit => {
                 self.commit_config();
                 iced::exit()
@@ -432,6 +477,16 @@ impl App {
         open.map(Message::WindowOpened)
     }
 
+    /// The tray icon set to draw from: the dotted variant whenever the active
+    /// device's calibration is incomplete, otherwise the plain one.
+    fn active_icons(&self) -> &TrayIcons {
+        if self.calibration_incomplete {
+            &self.icons.dotted
+        } else {
+            &self.icons.plain
+        }
+    }
+
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
         if enabled {
@@ -443,9 +498,9 @@ impl App {
                 // Only claim "quiet" when a stream actually exists to make it
                 // true; with no input device, stay on the off icon rather
                 // than lying that monitoring resumed.
-                let _ = self.tray.set_icon(Some(self.icons.quiet.clone()));
+                let _ = self.tray.set_icon(Some(self.active_icons().quiet.clone()));
             } else {
-                let _ = self.tray.set_icon(Some(self.icons.off.clone()));
+                let _ = self.tray.set_icon(Some(self.active_icons().off.clone()));
             }
             // Drop any stale state from before the toggle (e.g. Loud lingering
             // across a disable/enable) so the status line doesn't flash a
@@ -455,7 +510,7 @@ impl App {
             if let Some(stream) = &self.stream {
                 let _ = stream.pause();
             }
-            let _ = self.tray.set_icon(Some(self.icons.off.clone()));
+            let _ = self.tray.set_icon(Some(self.active_icons().off.clone()));
         }
     }
 
@@ -498,6 +553,17 @@ impl App {
         // finished calibration must survive even if the app never reaches a
         // commit point.
         let _ = self.config.save();
+
+        // Recompute the dot/banner flag and repaint the tray immediately —
+        // a calibration finishing must not wait for the next state change to
+        // stop showing the dot.
+        self.calibration_incomplete = calibration_incomplete_for(&self.config, &self.device_name);
+        let icon = if self.enabled && self.stream.is_some() {
+            self.active_icons().for_state(self.latest_tray_state)
+        } else {
+            self.active_icons().off.clone()
+        };
+        let _ = self.tray.set_icon(Some(icon));
     }
 
     fn send_gate(&mut self) {
@@ -560,6 +626,32 @@ fn calibration_from_result(result: &WizardResult, prior_sensitivity: Option<f32>
     }
 }
 
+/// True when the active device's calibration is missing, `BaselineOnly`, or
+/// degrades to an uncalibrated `Tuning` (e.g. a hand-edited or half-parsed
+/// config entry) — the single source of truth for both the tray's dot icon
+/// and the settings banner.
+fn calibration_incomplete_for(config: &Config, device_name: &str) -> bool {
+    match config.calibration.get(device_name) {
+        None => true,
+        Some(entry) => {
+            entry.state == CalibrationState::BaselineOnly || entry.tuning().quiet_db.is_none()
+        }
+    }
+}
+
+/// Whether the once-per-day calibration-incomplete banner should be visible.
+/// Pure and parameterized so the date/hour syscalls stay out of `view`.
+pub fn banner_visible(incomplete: bool, dismissed_on: Option<&str>, today: &str) -> bool {
+    incomplete && dismissed_on != Some(today)
+}
+
+/// Whether the "mic level shifted" staleness nudge should be visible. Only
+/// meaningful once calibration is complete (an incomplete calibration shows
+/// its own banner instead, which always wins — see `ui::settings::view`).
+pub fn drift_nudge_visible(incomplete: bool, drift_db: f32, dismissed: bool) -> bool {
+    !incomplete && !dismissed && drift_db.is_finite() && drift_db >= 2.9
+}
+
 /// Local wall-clock hour (0-23). Only the wizard's late-night default reads
 /// it, and it takes the hour as a parameter, so this stays a leaf function
 /// with no pure logic inside it.
@@ -578,6 +670,24 @@ fn local_hour() -> u32 {
 #[cfg(not(windows))]
 fn local_hour() -> u32 {
     12
+}
+
+/// Today's local date as an ISO string ("2026-08-27"), for the once-per-day
+/// banner-dismissal comparison. Only the leaf reads the clock; `banner_visible`
+/// takes the result as a plain `&str` parameter.
+#[cfg(windows)]
+fn local_date() -> String {
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    let mut now = SYSTEMTIME::default();
+    // SAFETY: `GetLocalTime` only writes a full `SYSTEMTIME` through the
+    // pointer we own here; it cannot fail.
+    unsafe { windows_sys::Win32::System::SystemInformation::GetLocalTime(&raw mut now) };
+    format!("{:04}-{:02}-{:02}", now.wYear, now.wMonth, now.wDay)
+}
+
+#[cfg(not(windows))]
+fn local_date() -> String {
+    "1970-01-01".to_string()
 }
 
 /// Best-effort Windows 11 rounded corners for the borderless settings window
@@ -727,5 +837,106 @@ mod tests {
     fn first_calibration_defaults_sensitivity_to_half() {
         let cal = calibration_from_result(&result(Some(-18.0)), None);
         assert_eq!(cal.sensitivity, 0.5);
+    }
+
+    #[test]
+    fn banner_visible_when_incomplete_and_never_dismissed() {
+        assert!(banner_visible(true, None, "2026-08-27"));
+    }
+
+    #[test]
+    fn banner_hidden_same_day_after_dismissal() {
+        assert!(!banner_visible(true, Some("2026-08-27"), "2026-08-27"));
+    }
+
+    #[test]
+    fn banner_visible_again_next_day() {
+        assert!(banner_visible(true, Some("2026-08-27"), "2026-08-28"));
+    }
+
+    #[test]
+    fn banner_hidden_when_calibration_complete() {
+        assert!(!banner_visible(false, None, "2026-08-27"));
+        assert!(!banner_visible(false, Some("2026-08-26"), "2026-08-27"));
+    }
+
+    #[test]
+    fn drift_nudge_hidden_while_calibration_incomplete() {
+        assert!(!drift_nudge_visible(true, 5.0, false));
+    }
+
+    #[test]
+    fn drift_nudge_hidden_below_the_clamp_threshold() {
+        assert!(!drift_nudge_visible(false, 2.5, false));
+    }
+
+    #[test]
+    fn drift_nudge_visible_at_or_above_threshold() {
+        assert!(drift_nudge_visible(false, 2.9, false));
+        assert!(drift_nudge_visible(false, 3.0, false));
+    }
+
+    #[test]
+    fn drift_nudge_hidden_when_dismissed_this_session() {
+        assert!(!drift_nudge_visible(false, 3.0, true));
+    }
+
+    #[test]
+    fn drift_nudge_hidden_when_drift_is_nan() {
+        assert!(!drift_nudge_visible(false, f32::NAN, false));
+    }
+
+    #[test]
+    fn calibration_incomplete_when_no_entry_for_device() {
+        let config = Config::default();
+        assert!(calibration_incomplete_for(&config, "Mic"));
+    }
+
+    #[test]
+    fn calibration_incomplete_when_baseline_only() {
+        let mut config = Config::default();
+        config.calibration.insert(
+            "Mic".into(),
+            DeviceCalibration {
+                state: CalibrationState::BaselineOnly,
+                quiet_db: -34.0,
+                ceiling_db: None,
+                noise_floor_db: -58.0,
+                sensitivity: 0.5,
+            },
+        );
+        assert!(calibration_incomplete_for(&config, "Mic"));
+    }
+
+    #[test]
+    fn calibration_incomplete_when_tuning_degrades_to_uncalibrated() {
+        let mut config = Config::default();
+        config.calibration.insert(
+            "Mic".into(),
+            DeviceCalibration {
+                state: CalibrationState::CeilingSet,
+                quiet_db: f32::NAN, // half-parsed entry: degrades to uncalibrated
+                ceiling_db: Some(-18.0),
+                noise_floor_db: -58.0,
+                sensitivity: 0.5,
+            },
+        );
+        assert!(calibration_incomplete_for(&config, "Mic"));
+    }
+
+    #[test]
+    fn calibration_complete_when_ceiling_set_with_valid_tuning() {
+        let mut config = Config::default();
+        config.calibration.insert(
+            "Mic".into(),
+            DeviceCalibration {
+                state: CalibrationState::CeilingSet,
+                quiet_db: -34.0,
+                ceiling_db: Some(-18.0),
+                noise_floor_db: -58.0,
+                sensitivity: 0.5,
+            },
+        );
+        assert!(!calibration_incomplete_for(&config, "Mic"));
     }
 }

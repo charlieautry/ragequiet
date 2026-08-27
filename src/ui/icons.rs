@@ -30,6 +30,17 @@ impl TrayIcons {
         }
     }
 
+    /// Dotted variants of the same four icons, composited with the
+    /// calibration-incomplete marker (top-right yellow dot).
+    fn load_dotted() -> Self {
+        Self {
+            quiet: tray_icon_from_png_dotted(TRAY_QUIET),
+            warning: tray_icon_from_png_dotted(TRAY_WARNING),
+            loud: tray_icon_from_png_dotted(TRAY_LOUD),
+            off: tray_icon_from_png_dotted(TRAY_OFF),
+        }
+    }
+
     /// The icon for a live tray state (monitoring enabled).
     pub fn for_state(&self, state: TrayState) -> tray_icon::Icon {
         match state {
@@ -38,6 +49,59 @@ impl TrayIcons {
             TrayState::Loud => self.loud.clone(),
         }
     }
+}
+
+/// Both tray icon variants, decoded once at boot; the app picks `dotted`
+/// whenever the active device's calibration is incomplete.
+pub struct TrayIconSets {
+    pub plain: TrayIcons,
+    pub dotted: TrayIcons,
+}
+
+impl TrayIconSets {
+    pub fn load() -> Self {
+        Self { plain: TrayIcons::load(), dotted: TrayIcons::load_dotted() }
+    }
+}
+
+/// Calibration-incomplete marker: opaque #ffd23f (brand palette), 1px ink
+/// (#15171c) outline ring, radius 5, centered near the icon's top-right
+/// corner at 32x32.
+const DOT_COLOR: [u8; 4] = [0xff, 0xd2, 0x3f, 0xff];
+const DOT_OUTLINE_COLOR: [u8; 4] = [0x15, 0x17, 0x1c, 0xff];
+const DOT_CENTER_X: i32 = 25;
+const DOT_CENTER_Y: i32 = 6;
+const DOT_RADIUS: i32 = 5;
+const DOT_OUTLINE_WIDTH: i32 = 1;
+const ICON_SIZE: i32 = 32;
+
+/// Composites the calibration dot onto a copy of a 32x32 RGBA buffer. Pure
+/// and allocation-obvious (one `Vec` in, one `Vec` out) so it's cheap to unit
+/// test without decoding a real PNG.
+fn with_calibration_dot(rgba: &[u8]) -> Vec<u8> {
+    let mut out = rgba.to_vec();
+    let fill_radius_sq = DOT_RADIUS * DOT_RADIUS;
+    let outline_radius = DOT_RADIUS + DOT_OUTLINE_WIDTH;
+    let outline_radius_sq = outline_radius * outline_radius;
+    for y in 0..ICON_SIZE {
+        for x in 0..ICON_SIZE {
+            let dx = x - DOT_CENTER_X;
+            let dy = y - DOT_CENTER_Y;
+            let dist_sq = dx * dx + dy * dy;
+            let color = if dist_sq <= fill_radius_sq {
+                Some(DOT_COLOR)
+            } else if dist_sq <= outline_radius_sq {
+                Some(DOT_OUTLINE_COLOR)
+            } else {
+                None
+            };
+            if let Some(color) = color {
+                let idx = ((y * ICON_SIZE + x) * 4) as usize;
+                out[idx..idx + 4].copy_from_slice(&color);
+            }
+        }
+    }
+    out
 }
 
 /// Decode PNG bytes into an RGBA8 buffer plus dimensions. Panics on a
@@ -68,6 +132,12 @@ fn tray_icon_from_png(bytes: &[u8]) -> tray_icon::Icon {
     tray_icon::Icon::from_rgba(rgba, w, h).expect("valid tray icon buffer")
 }
 
+fn tray_icon_from_png_dotted(bytes: &[u8]) -> tray_icon::Icon {
+    let (rgba, w, h) = decode_rgba(bytes);
+    let dotted = with_calibration_dot(&rgba);
+    tray_icon::Icon::from_rgba(dotted, w, h).expect("valid tray icon buffer")
+}
+
 /// The window/taskbar icon for the settings window.
 pub fn window_icon() -> iced::window::icon::Icon {
     let (rgba, w, h) = decode_rgba(WINDOW_ICON);
@@ -96,5 +166,45 @@ mod tests {
         assert_32x32_rgba_with_visible_pixels(TRAY_LOUD);
         assert_32x32_rgba_with_visible_pixels(TRAY_OFF);
         assert_32x32_rgba_with_visible_pixels(WINDOW_ICON);
+    }
+
+    fn blank_rgba() -> Vec<u8> {
+        vec![0u8; 32 * 32 * 4]
+    }
+
+    fn pixel_at(rgba: &[u8], x: i32, y: i32) -> [u8; 4] {
+        let idx = ((y * ICON_SIZE + x) * 4) as usize;
+        [rgba[idx], rgba[idx + 1], rgba[idx + 2], rgba[idx + 3]]
+    }
+
+    #[test]
+    fn calibration_dot_output_length_matches_input() {
+        let input = blank_rgba();
+        let out = with_calibration_dot(&input);
+        assert_eq!(out.len(), input.len());
+    }
+
+    #[test]
+    fn calibration_dot_center_pixel_is_the_brand_yellow() {
+        let out = with_calibration_dot(&blank_rgba());
+        assert_eq!(pixel_at(&out, DOT_CENTER_X, DOT_CENTER_Y), [0xff, 0xd2, 0x3f, 0xff]);
+    }
+
+    #[test]
+    fn calibration_dot_leaves_pixels_far_from_the_dot_unchanged() {
+        let input = blank_rgba();
+        let out = with_calibration_dot(&input);
+        // Bottom-left corner is nowhere near the top-right dot.
+        assert_eq!(pixel_at(&out, 0, 31), [0, 0, 0, 0]);
+        assert_eq!(pixel_at(&out, 1, 30), [0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn calibration_dot_does_not_touch_pixels_outside_its_bounding_box() {
+        // A pixel a couple of dot-radii away in every direction stays input.
+        let input = blank_rgba();
+        let out = with_calibration_dot(&input);
+        assert_eq!(pixel_at(&out, DOT_CENTER_X - 10, DOT_CENTER_Y), [0, 0, 0, 0]);
+        assert_eq!(pixel_at(&out, DOT_CENTER_X, DOT_CENTER_Y + 10), [0, 0, 0, 0]);
     }
 }
