@@ -7,6 +7,8 @@ mod bridge;
 mod config;
 mod detector;
 mod engine;
+#[allow(dead_code)] // wired into the player task
+mod sounds;
 mod ui;
 
 fn main() -> iced::Result {
