@@ -62,7 +62,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
             app.device_changed_note,
         ),
         None => {
-            let mut col = column![].spacing(16).width(Length::Fill);
+            let mut col = column![].spacing(12).width(Length::Fill);
             if let Some(error) = &app.wizard_error {
                 col = col.push(wizard_error_row(error));
             }
@@ -86,12 +86,17 @@ pub fn view(app: &App) -> Element<'_, Message> {
         }
     };
 
-    // A safety net, not the primary layout: the controls/wizard body should
-    // fit in the window on its own, but if a banner, wrapped alert copy, or a
-    // long device name ever pushes it past the fold, this guarantees every
-    // control (including Cancel/Finish) stays reachable instead of clipping.
-    // The chrome row lives outside this scrollable so the window stays
-    // movable/closable no matter how tall the body gets.
+    // The default controls stack (no banner, no wizard error) fits inside the
+    // 400x760 window on its own — meter/status/alerts/sensitivity/hold/
+    // cooldown/sound/volume/output-device/test-mode/autostart/input/CPU is 13
+    // rows at 12px spacing, comfortably under the ~660px available once the
+    // chrome row, container padding, and content-column spacing are
+    // subtracted. This scrollable is a safety net, not the primary layout: if
+    // a banner, wrapped alert copy, or a long device name ever pushes the
+    // body past the fold anyway, every control (including Cancel/Finish)
+    // still stays reachable instead of clipping. The chrome row lives outside
+    // this scrollable so the window stays movable/closable no matter how tall
+    // the body gets.
     let scrollable_body = scrollable(body)
         .width(Length::Fill)
         .height(Length::Fill)

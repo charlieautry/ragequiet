@@ -701,6 +701,12 @@ impl App {
                     SoundChoice::Builtin(b) => {
                         self.config.alert_sound = AlertSound::Builtin(b);
                         self.config_dirty = true;
+                        // Switching to a built-in leaves any custom-sound decode
+                        // error behind for good: it no longer applies to what's
+                        // selected, and the decoded buffer (a few MB) is no
+                        // longer needed either.
+                        self.sound_error = None;
+                        self.custom_sound = None;
                         self.commit_config();
                         Task::none()
                     }
@@ -819,7 +825,7 @@ impl App {
             return Task::none();
         }
         let (_, open) = window::open(window::Settings {
-            size: iced::Size::new(400.0, 600.0),
+            size: iced::Size::new(400.0, 760.0),
             resizable: false,
             decorations: false,
             icon: Some(ui::icons::window_icon()),
