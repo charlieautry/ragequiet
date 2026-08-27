@@ -90,6 +90,13 @@ impl Engine {
         self.threshold_for(None)
     }
 
+    /// Swap detection anchors on a live engine without touching the adaptive
+    /// baselines — a sensitivity tweak keeps accumulated drift context.
+    #[allow(dead_code)] // used from the settings UI on
+    pub fn set_tuning(&mut self, tuning: Tuning) {
+        self.tuning = tuning;
+    }
+
     /// `seed`: in uncalibrated mode, the level to fall back on before the
     /// baseline has data (process passes the current frame's level).
     fn threshold_for(&mut self, seed: Option<f32>) -> f32 {
@@ -97,7 +104,8 @@ impl Engine {
             Some(quiet) => {
                 // Anchored mode: the baseline may drift with the room/mic, but
                 // upward at most +3 dB — a bigger shift means "recalibrate",
-                // and a sustained dark-timbre shout can't retrain the threshold.
+                // and a sustained dark-timbre shout moves the threshold by at
+                // most the clamp width, not past it.
                 let drift = (self.level_baseline.median().unwrap_or(quiet) - quiet).clamp(-6.0, 3.0);
                 self.base_threshold_db() + drift
             }
@@ -294,6 +302,20 @@ mod tests {
         assert_eq!(after - before, 0, "hot path allocated {} times", after - before);
     }
 
+    #[test]
+    fn completed_measurement_push_never_allocates() {
+        use crate::engine::calibrate::Measurement;
+        let mut m = Measurement::voiced_level(1.0);
+        let voice = mix(16000.0, FRAME_SIZE, &[(200.0, 0.02)]);
+        while m.push(&voice).is_none() {}
+        let before = ALLOC_COUNT.with(|c| c.get());
+        for _ in 0..100 {
+            assert!(m.push(&voice).is_some());
+        }
+        let after = ALLOC_COUNT.with(|c| c.get());
+        assert_eq!(after - before, 0, "post-completion push allocated {} times", after - before);
+    }
+
     fn calibrated_engine(sensitivity: f32, ceiling: Option<f32>) -> Engine {
         Engine::with_tuning(Tuning {
             noise_floor_db: -58.0,
@@ -312,6 +334,19 @@ mod tests {
         assert!((e_high.base_threshold_db() - (-17.0)).abs() < 0.01);
         let e_mid = calibrated_engine(0.5, Some(-17.0));
         assert!((e_mid.base_threshold_db() - (-27.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn set_tuning_swaps_anchors_on_a_live_engine() {
+        let mut e = calibrated_engine(0.5, Some(-17.0));
+        assert!((e.base_threshold_db() - (-27.0)).abs() < 0.01);
+        e.set_tuning(Tuning {
+            noise_floor_db: -58.0,
+            quiet_db: Some(-37.0),
+            ceiling_db: Some(-17.0),
+            sensitivity: 1.0,
+        });
+        assert!((e.base_threshold_db() - (-17.0)).abs() < 0.01);
     }
 
     #[test]

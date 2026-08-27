@@ -14,9 +14,11 @@ pub fn ceiling_is_sane(quiet_db: f32, ceiling_db: f32) -> bool {
 #[allow(dead_code)] // used from the wizard UI on
 pub struct Measurement {
     samples: Vec<f32>,
+    scratch: Vec<f32>,
     target: usize,
     voiced_only: bool,
     spectrum: Spectrum,
+    result: Option<f32>,
 }
 
 #[allow(dead_code)] // used from the wizard UI on
@@ -36,16 +38,23 @@ impl Measurement {
         let target = ((seconds * frames_per_sec as f32) as usize).max(1);
         Self {
             samples: Vec::with_capacity(target),
+            scratch: Vec::with_capacity(target),
             target,
             voiced_only,
             spectrum: Spectrum::new(FRAME_SIZE, SAMPLE_RATE as f32),
+            result: None,
         }
     }
 
     /// Feed one frame; Some(median dB) once the target frame count is reached.
+    /// Allocation-free once complete: a wizard step can keep feeding a
+    /// finished `Measurement` (e.g. while waiting on the UI) without cost.
     pub fn push(&mut self, frame: &[f32]) -> Option<f32> {
+        if let Some(r) = self.result {
+            return Some(r);
+        }
         if self.samples.len() >= self.target {
-            return Some(self.median());
+            return Some(self.complete());
         }
         let db = db_from_rms(rms(frame));
         if self.voiced_only {
@@ -55,17 +64,26 @@ impl Measurement {
             }
         }
         self.samples.push(db);
-        (self.samples.len() >= self.target).then(|| self.median())
+        if self.samples.len() >= self.target {
+            Some(self.complete())
+        } else {
+            None
+        }
     }
 
     pub fn progress(&self) -> f32 {
         self.samples.len() as f32 / self.target as f32
     }
 
-    fn median(&self) -> f32 {
-        let mut sorted = self.samples.clone();
-        sorted.sort_by(|a, b| a.total_cmp(b));
-        sorted[sorted.len() / 2]
+    fn complete(&mut self) -> f32 {
+        let n = self.samples.len();
+        self.scratch.clear();
+        self.scratch.extend_from_slice(&self.samples);
+        let mid = n / 2;
+        self.scratch.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+        let median = self.scratch[mid];
+        self.result = Some(median);
+        median
     }
 }
 
