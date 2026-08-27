@@ -14,9 +14,8 @@ pub const YELLOW: Color = Color::from_rgb8(0xff, 0xb0, 0x20);
 pub const RED: Color = Color::from_rgb8(0xff, 0x3b, 0x4a);
 
 pub const BACKGROUND: Color = Color::from_rgb8(0x15, 0x17, 0x1c);
-/// Slightly lighter panel color for the meter background; consumed by the
-/// meter canvas in a later task.
-#[expect(dead_code)]
+/// Slightly lighter panel color for the meter background and other
+/// panel-like surfaces (the meter placeholder slot).
 pub const SURFACE: Color = Color::from_rgb8(0x1d, 0x20, 0x26);
 pub const TEXT: Color = Color::from_rgb(0.92, 0.92, 0.93);
 pub const TEXT_MUTED: Color = Color::from_rgb(0.55, 0.55, 0.58);

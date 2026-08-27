@@ -3075,6 +3075,7 @@ dependencies = [
  "serde",
  "toml 1.1.4+spec-1.1.0",
  "tray-icon",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 

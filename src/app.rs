@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use cpal::traits::StreamTrait;
 use futures::SinkExt;
-use iced::widget::{column, container, text};
+use iced::widget::column;
 use iced::{window, Element, Subscription, Task, Theme};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIcon, TrayIconBuilder};
@@ -53,19 +53,21 @@ pub struct App {
     enabled_item: CheckMenuItem,
     menu_ids: MenuIds,
     settings_window: Option<window::Id>,
-    enabled: bool,
-    alerts_this_session: u32,
-    test_mode: bool,
-    config: Config,
-    device_name: String,
+    pub(crate) enabled: bool,
+    pub(crate) alerts_this_session: u32,
+    pub(crate) test_mode: bool,
+    pub(crate) config: Config,
+    pub(crate) device_name: String,
     shared: Arc<SharedLevels>,
     commands: CommandTx,
     /// None when the input device could not be opened; the app still runs.
     stream: Option<cpal::Stream>,
-    tuning_meta: TuningMeta,
+    pub(crate) tuning_meta: TuningMeta,
     icons: TrayIcons,
     /// (level_db, threshold_db, peak_db) sampled on Tick so `view` stays pure.
     latest: (f32, f32, f32),
+    /// Last tray state seen, for the settings window's status line.
+    pub(crate) latest_tray_state: TrayState,
 }
 
 #[derive(Debug, Clone)]
@@ -76,14 +78,19 @@ pub enum Message {
     WindowOpened(window::Id),
     WindowClosed(window::Id),
     Tick,
-    #[expect(dead_code)] // emitted by the settings view in a later task
     SensitivityChanged(f32),
-    #[expect(dead_code)]
     HoldChanged(u64),
-    #[expect(dead_code)]
     CooldownChanged(u64),
-    #[expect(dead_code)]
     TestModeToggled(bool),
+    /// Emitted by the chrome row's drag handle (a `mouse_area` over the
+    /// title/spacer region); moves the borderless settings window.
+    DragWindow,
+    /// Emitted by the chrome row's close button.
+    CloseSettings,
+    /// Emitted on slider release: the single point where a config edit is
+    /// persisted to disk (the per-tick `*Changed` messages only push the live
+    /// `Command` so the engine reacts immediately, without hammering disk).
+    SettingsCommitted,
     Quit,
 }
 
@@ -190,6 +197,7 @@ impl App {
                 tuning_meta,
                 icons,
                 latest: (0.0, 0.0, 0.0),
+                latest_tray_state: TrayState::Quiet,
             },
             Task::none(), // no window at launch: the app lives in the tray
         )
@@ -216,6 +224,7 @@ impl App {
                 Task::none()
             }
             Message::TrayStateChanged(state) => {
+                self.latest_tray_state = state;
                 if self.enabled {
                     let _ = self.tray.set_icon(Some(self.icons.for_state(state)));
                 }
@@ -227,7 +236,7 @@ impl App {
             }
             Message::WindowOpened(id) => {
                 self.settings_window = Some(id);
-                Task::none()
+                round_corners(id)
             }
             Message::WindowClosed(id) => {
                 if self.settings_window == Some(id) {
@@ -240,12 +249,14 @@ impl App {
                 Task::none()
             }
             Message::SensitivityChanged(value) => {
+                // Live feel: the engine hears every tick via `SetTuning`, but
+                // the config file is only written on `SettingsCommitted`
+                // (slider release) so dragging doesn't hammer disk.
                 if let Some(entry) = self.config.calibration.get_mut(&self.device_name) {
                     entry.sensitivity = value;
                     let tuning = entry.tuning();
                     let _ = self.commands.send(Command::SetTuning(tuning));
                     self.tuning_meta.sensitivity = tuning.sensitivity;
-                    let _ = self.config.save();
                 }
                 Task::none()
             }
@@ -260,8 +271,21 @@ impl App {
                 Task::none()
             }
             Message::TestModeToggled(on) => {
+                // Session-only by design: test mode is never persisted.
                 self.test_mode = on;
                 let _ = self.commands.send(Command::SetTestMode(on));
+                Task::none()
+            }
+            Message::DragWindow => match self.settings_window {
+                Some(id) => window::drag(id),
+                None => Task::none(),
+            },
+            Message::CloseSettings => match self.settings_window {
+                Some(id) => window::close(id),
+                None => Task::none(),
+            },
+            Message::SettingsCommitted => {
+                let _ = self.config.save();
                 Task::none()
             }
             Message::Quit => iced::exit(),
@@ -272,23 +296,7 @@ impl App {
         if Some(window_id) != self.settings_window {
             return column![].into();
         }
-        let title = text("Ragequiet")
-            .font(ui::theme::FONT_SEMIBOLD)
-            .size(24)
-            .color(ui::theme::TEXT);
-        let subtitle = text("settings window")
-            .font(ui::theme::FONT_REGULAR)
-            .size(14)
-            .color(ui::theme::TEXT_MUTED);
-        container(column![title, subtitle].spacing(8))
-            .width(iced::Length::Fill)
-            .height(iced::Length::Fill)
-            .padding(20)
-            .style(|_theme: &Theme| container::Style {
-                background: Some(ui::theme::BACKGROUND.into()),
-                ..container::Style::default()
-            })
-            .into()
+        ui::settings::view(self)
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
@@ -313,8 +321,9 @@ impl App {
             return Task::none();
         }
         let (_, open) = window::open(window::Settings {
-            size: iced::Size::new(380.0, 520.0),
+            size: iced::Size::new(380.0, 560.0),
             resizable: false,
+            decorations: false,
             icon: Some(ui::icons::window_icon()),
             ..window::Settings::default()
         });
@@ -344,8 +353,42 @@ impl App {
             hold_ms: self.config.hold_ms,
             cooldown_ms: self.config.cooldown_ms,
         });
-        let _ = self.config.save();
     }
+}
+
+/// Best-effort Windows 11 rounded corners for the borderless settings window
+/// (`DWMWA_WINDOW_CORNER_PREFERENCE` = 33, `DWMWCP_ROUND` = 2). No-op on
+/// failure (older Windows, or the window closing before this runs) and on
+/// non-Windows targets: square corners are an acceptable fallback.
+#[cfg(windows)]
+fn round_corners(id: window::Id) -> Task<Message> {
+    window::run(id, |handle| {
+        use iced::window::raw_window_handle::RawWindowHandle;
+        if let Ok(window_handle) = handle.window_handle()
+            && let RawWindowHandle::Win32(win32) = window_handle.as_raw()
+        {
+            const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+            let corner_preference: u32 = 2; // DWMWCP_ROUND
+            let hwnd = win32.hwnd.get() as windows_sys::Win32::Foundation::HWND;
+            // SAFETY: `hwnd` came from a live raw-window-handle for the
+            // window this callback is running against; the attribute value
+            // is a plain u32 whose address and size we pass correctly.
+            unsafe {
+                let _ = windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_WINDOW_CORNER_PREFERENCE,
+                    (&raw const corner_preference).cast(),
+                    std::mem::size_of::<u32>() as u32,
+                );
+            }
+        }
+    })
+    .discard()
+}
+
+#[cfg(not(windows))]
+fn round_corners(_id: window::Id) -> Task<Message> {
+    Task::none()
 }
 
 /// Bridges muda's blocking crossbeam menu-event receiver into iced's async
