@@ -49,10 +49,15 @@ pub struct Engine {
     tilt_baseline: RollingMedian,
     tuning: Tuning,
     unfed_streak: u32,
-    /// Cached by `threshold_for`'s calibrated arm (baseline median minus the
-    /// quiet point, clamped the same as the threshold's own upward drift);
-    /// NaN in uncalibrated mode. `baseline_drift_db` just reads this back —
-    /// no second median computation per frame.
+    /// Cached by `threshold_for`'s calibrated arm: the raw (unclamped)
+    /// baseline median minus the quiet point; NaN in uncalibrated mode. The
+    /// clamp that caps the threshold's own upward drift is applied only to
+    /// the value used for the threshold, not to this diagnostic — otherwise
+    /// a baseline that has merely saturated the clamp (which ordinary calm
+    /// speech reaches, since the feed cutoff sits a few dB above the quiet
+    /// point) would be indistinguishable from a genuine level shift.
+    /// `baseline_drift_db` just reads this back — no second median
+    /// computation per frame.
     last_drift_db: f32,
 }
 
@@ -109,10 +114,13 @@ impl Engine {
                 // Anchored mode: the baseline may drift with the room/mic, but
                 // upward at most +3 dB — a bigger shift means "recalibrate",
                 // and a sustained dark-timbre shout moves the threshold by at
-                // most the clamp width, not past it.
-                let drift = (self.level_baseline.median().unwrap_or(quiet) - quiet).clamp(-6.0, 3.0);
-                self.last_drift_db = drift;
-                self.base_threshold_db() + drift
+                // most the clamp width, not past it. The unclamped value is
+                // cached separately (see `last_drift_db`) so a diagnostic
+                // consumer can tell "saturated the clamp" apart from "still
+                // climbing".
+                let raw_drift = self.level_baseline.median().unwrap_or(quiet) - quiet;
+                self.last_drift_db = raw_drift;
+                self.base_threshold_db() + raw_drift.clamp(-6.0, 3.0)
             }
             None => {
                 self.last_drift_db = f32::NAN;
@@ -123,10 +131,10 @@ impl Engine {
     }
 
     /// Baseline drift since calibration (dB): how far the adaptive baseline
-    /// has moved from the calibrated quiet point, clamped the same way the
-    /// threshold itself is. NaN when uncalibrated. Free: it just returns the
-    /// value `threshold_for` already cached this frame, rather than running a
-    /// second median.
+    /// has moved from the calibrated quiet point, unclamped (unlike the
+    /// threshold itself, which caps its upward move at +3 dB). NaN when
+    /// uncalibrated. Free: it just returns the value `threshold_for` already
+    /// cached this frame, rather than running a second median.
     pub fn baseline_drift_db(&self) -> f32 {
         self.last_drift_db
     }
@@ -399,20 +407,50 @@ mod tests {
     }
 
     #[test]
-    fn baseline_drift_grows_positive_after_a_gain_step() {
+    fn baseline_drift_grows_well_past_the_clamp_after_a_gain_step() {
         let mut e = calibrated_engine(0.5, Some(-17.0));
         let quiet = quiet_voice();
         for _ in 0..50 {
             e.process(&quiet);
         }
         // +12 dB gain step, same voice/spectral shape: the baseline retrains
-        // upward and the cached drift should reach the nudge threshold.
+        // upward and the cached drift should report the real (unclamped)
+        // shift of ~+12 dB, not the +3 dB the threshold itself caps at —
+        // and a shift that size is exactly what should wake the nudge.
         let boosted = mix(16000.0, FRAME_SIZE, &[(200.0, 0.08), (1500.0, 0.016)]);
         for _ in 0..2000 {
             e.process(&boosted);
         }
         let drift = e.baseline_drift_db();
-        assert!(drift >= 2.9, "expected drift to grow toward the +3 dB clamp, got {drift}");
+        assert!(drift >= 8.0, "expected drift to reach well past the +3 dB clamp, got {drift}");
+        assert!(
+            crate::app::drift_nudge_visible(false, drift, false),
+            "a genuine +12 dB gain step must wake the drift nudge, got drift {drift}"
+        );
+    }
+
+    #[test]
+    fn ordinary_speech_does_not_trigger_the_drift_nudge() {
+        // Calibrated quiet at -40.0, below quiet_voice()'s natural ~-36.9 dB:
+        // warming up on ordinary calm speech settles the baseline about
+        // +3 dB above the calibrated quiet point. That is a legitimate,
+        // harmless baseline position (the feed cutoff sits at roughly
+        // quiet+8) and must never read as "recalibrate".
+        let mut e = Engine::with_tuning(Tuning {
+            noise_floor_db: -58.0,
+            quiet_db: Some(-40.0),
+            ceiling_db: Some(-17.0),
+            sensitivity: 0.5,
+        });
+        let quiet = quiet_voice();
+        for _ in 0..200 {
+            e.process(&quiet);
+        }
+        let drift = e.baseline_drift_db();
+        assert!(
+            !crate::app::drift_nudge_visible(false, drift, false),
+            "ordinary speech baseline drift of {drift} dB must not trigger the nudge"
+        );
     }
 
     #[test]

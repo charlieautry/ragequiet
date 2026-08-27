@@ -674,8 +674,13 @@ pub fn banner_visible(incomplete: bool, dismissed_on: Option<&str>, today: &str)
 /// Whether the "mic level shifted" staleness nudge should be visible. Only
 /// meaningful once calibration is complete (an incomplete calibration shows
 /// its own banner instead, which always wins — see `ui::settings::view`).
+/// 6.0 dB is well above the engine's +3 dB threshold clamp, so ordinary calm
+/// speech (whose baseline commonly settles a few dB above the calibrated
+/// quiet point, since the feed cutoff sits a few dB higher still) never
+/// reaches it; only a genuine level shift — a gain change or a moved mic —
+/// does.
 pub fn drift_nudge_visible(incomplete: bool, drift_db: f32, dismissed: bool) -> bool {
-    !incomplete && !dismissed && drift_db.is_finite() && drift_db >= 2.9
+    !incomplete && !dismissed && drift_db.is_finite() && drift_db >= 6.0
 }
 
 /// Local wall-clock hour (0-23). Only the wizard's late-night default reads
@@ -892,14 +897,20 @@ mod tests {
     }
 
     #[test]
-    fn drift_nudge_hidden_below_the_clamp_threshold() {
+    fn drift_nudge_hidden_below_the_threshold() {
         assert!(!drift_nudge_visible(false, 2.5, false));
+        // At (and just past) the old threshold, and even at the engine's
+        // own +3 dB clamp — ordinary speech reaches this, so it must stay
+        // quiet.
+        assert!(!drift_nudge_visible(false, 2.9, false));
+        assert!(!drift_nudge_visible(false, 3.0, false));
+        assert!(!drift_nudge_visible(false, 5.9, false));
     }
 
     #[test]
     fn drift_nudge_visible_at_or_above_threshold() {
-        assert!(drift_nudge_visible(false, 2.9, false));
-        assert!(drift_nudge_visible(false, 3.0, false));
+        assert!(drift_nudge_visible(false, 6.0, false));
+        assert!(drift_nudge_visible(false, 12.0, false));
     }
 
     #[test]
