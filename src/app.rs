@@ -212,10 +212,15 @@ pub struct App {
     /// Fixed reference instant for converting `Instant::elapsed()` into the
     /// same 100-ns units `GetProcessTimes` reports in.
     cpu_epoch: std::time::Instant,
-    /// Exponentially smoothed CPU percent (`smoothed = smoothed*0.7 + pct*0.3`)
-    /// shown in the settings window; stays at 0.0 on non-Windows targets
+    /// Exponentially smoothed CPU percent shown in the settings window
+    /// (see `smooth_cpu_percent`); stays at 0.0 on non-Windows targets
     /// (`sysinfo::process_cpu_100ns` returns `None` there).
     pub(crate) cpu_percent_smoothed: f32,
+    /// Whether `cpu_percent_smoothed` has ever been seeded from a real
+    /// sample yet — lets `smooth_cpu_percent` seed directly from the first
+    /// computed percent instead of blending it down from the 0.0 initial
+    /// value (which would under-report for the first several Ticks).
+    cpu_percent_seeded: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -423,6 +428,7 @@ impl App {
                 cpu_sample: None,
                 cpu_epoch: std::time::Instant::now(),
                 cpu_percent_smoothed: 0.0,
+                cpu_percent_seeded: false,
             },
             Task::none(), // no window at launch: the app lives in the tray
         )
@@ -527,7 +533,11 @@ impl App {
                     let cur = (cpu_100ns, wall_100ns);
                     if let Some(prev) = self.cpu_sample {
                         let pct = sysinfo::cpu_percent(prev, cur);
-                        self.cpu_percent_smoothed = self.cpu_percent_smoothed * 0.7 + pct * 0.3;
+                        self.cpu_percent_smoothed = smooth_cpu_percent(
+                            self.cpu_percent_seeded.then_some(self.cpu_percent_smoothed),
+                            pct,
+                        );
+                        self.cpu_percent_seeded = true;
                     }
                     self.cpu_sample = Some(cur);
                 }
@@ -639,6 +649,12 @@ impl App {
                 if let Some(wizard) = self.wizard.as_mut()
                     && let Some(kind) = wizard.on_event(event)
                 {
+                    // A fresh measurement just started: the stall clock from
+                    // whatever step preceded it must not survive onto this
+                    // one, or "waiting to hear your voice" could flash true
+                    // for a render before the first real Tick corrects it.
+                    self.measure_progress_seen = 0.0;
+                    self.measure_stalled_ticks = 0;
                     // The `Measurement` is allocated here, on the UI thread —
                     // the audio callback only installs the finished value.
                     let measurement = crate::detector::measurement_for(kind);
@@ -1101,6 +1117,18 @@ pub fn stall_hint_visible(kind_is_voiced: bool, stalled_ticks: u32) -> bool {
     kind_is_voiced && stalled_ticks > 60
 }
 
+/// Exponential smoothing for the settings window's CPU readout:
+/// `previous: None` (no sample has ever landed yet) seeds directly from
+/// `pct` instead of blending it down from a 0.0 starting point, which would
+/// under-report for several `Tick`s after the first window open; every
+/// sample after that blends 70% previous / 30% new as usual.
+pub fn smooth_cpu_percent(previous: Option<f32>, pct: f32) -> f32 {
+    match previous {
+        Some(prev) => prev * 0.7 + pct * 0.3,
+        None => pct,
+    }
+}
+
 /// Local wall-clock hour (0-23). Only the wizard's late-night default reads
 /// it, and it takes the hour as a parameter, so this stays a leaf function
 /// with no pure logic inside it.
@@ -1415,6 +1443,16 @@ mod tests {
     fn stall_hint_visible_just_past_the_threshold() {
         assert!(stall_hint_visible(true, 61));
         assert!(stall_hint_visible(true, 1000));
+    }
+
+    #[test]
+    fn smooth_cpu_percent_seeds_directly_from_the_first_sample() {
+        assert_eq!(smooth_cpu_percent(None, 42.0), 42.0);
+    }
+
+    #[test]
+    fn smooth_cpu_percent_blends_seventy_thirty_after_seeding() {
+        assert!((smooth_cpu_percent(Some(10.0), 20.0) - 13.0).abs() < 0.001);
     }
 
     #[test]
