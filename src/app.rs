@@ -10,14 +10,16 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, Predefin
 use tray_icon::{TrayIcon, TrayIconBuilder};
 
 use crate::alert::AlertGate;
+use crate::audio;
 use crate::bridge::{self, Command, CommandTx, SharedLevels};
 use crate::config::{CalibrationState, Config, DeviceCalibration};
 use crate::detector::{Detector, MeasurementUpdate, TrayState};
 use crate::engine::Engine;
+use crate::player::{PlayRequest, Player};
+use crate::sounds::{self, BuiltinSound};
 use crate::ui;
 use crate::ui::calibrate::{Wizard, WizardEvent, WizardResult, WizardStep};
 use crate::ui::icons::{TrayIconSets, TrayIcons};
-use crate::{alert, audio};
 
 /// Rare events pushed from the audio callback to the UI.
 enum AudioEvent {
@@ -45,6 +47,28 @@ struct MenuIds {
     recalibrate: MenuId,
     settings: MenuId,
     quit: MenuId,
+}
+
+/// All six built-in alert sounds, rendered once at boot so a play request is
+/// just an `Arc` clone rather than re-synthesizing samples on every alert.
+struct SoundCache {
+    entries: [(BuiltinSound, Arc<Vec<f32>>); sounds::ALL.len()],
+}
+
+impl SoundCache {
+    fn render_all() -> Self {
+        Self {
+            entries: sounds::ALL.map(|s| (s, Arc::new(sounds::render(s)))),
+        }
+    }
+
+    fn get(&self, sound: BuiltinSound) -> Arc<Vec<f32>> {
+        self.entries
+            .iter()
+            .find(|(s, _)| *s == sound)
+            .map(|(_, samples)| Arc::clone(samples))
+            .expect("SoundCache::render_all covers every BuiltinSound")
+    }
 }
 
 /// Static markers the meter draws behind the live level, snapshotted from the
@@ -99,6 +123,11 @@ pub struct App {
     /// Session-only dismissal of the drift-staleness nudge; never resets
     /// (unlike the once-per-day banner, which tracks a date).
     pub(crate) drift_nudge_dismissed: bool,
+    /// All six built-in sounds, rendered once at boot.
+    sounds: SoundCache,
+    /// Owns the alert output stream's lifecycle on its own thread; `Beeped`
+    /// hands it play requests and never blocks.
+    player: Player,
 }
 
 #[derive(Debug, Clone)]
@@ -192,7 +221,6 @@ impl App {
                 detector.drift_db(),
             );
             if outcome.beep {
-                alert::play_beep();
                 let _ = events.send(AudioEvent::Beeped);
             }
             if let Some(state) = outcome.state_change {
@@ -225,6 +253,9 @@ impl App {
             &PredefinedMenuItem::separator(),
             &quit_item,
         ]);
+
+        let sounds = SoundCache::render_all();
+        let player = Player::spawn();
 
         let icons = TrayIconSets::load();
         let initial_icon_set = if calibration_incomplete { &icons.dotted } else { &icons.plain };
@@ -265,6 +296,8 @@ impl App {
                 today: local_date(),
                 hour: local_hour(),
                 drift_nudge_dismissed: false,
+                sounds,
+                player,
             },
             Task::none(), // no window at launch: the app lives in the tray
         )
@@ -301,6 +334,14 @@ impl App {
             }
             Message::Beeped => {
                 self.alerts_this_session += 1;
+                // Hardcoded selection for now; Task 3 wires this to config
+                // (alert_sound/alert_volume/output_device).
+                self.player.play(PlayRequest {
+                    samples: self.sounds.get(BuiltinSound::SoftBeep),
+                    source_rate: sounds::SOUND_RATE,
+                    volume: 0.8,
+                    device_name: None,
+                });
                 Task::none()
             }
             Message::WindowOpened(id) => {
