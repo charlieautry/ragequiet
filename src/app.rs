@@ -111,6 +111,7 @@ fn custom_sound_display_name(path: &str) -> String {
 
 /// Static markers the meter draws behind the live level, snapshotted from the
 /// device's calibration at boot.
+#[derive(Debug, Clone, Copy)]
 pub struct TuningMeta {
     pub noise_floor_db: f32,
     pub quiet_db: Option<f32>,
@@ -206,6 +207,16 @@ pub struct App {
     /// the wizard's Intro step, which renders the honest note when this is
     /// true).
     pub(crate) device_changed_note: bool,
+    /// Snapshot of `(device_name, tuning_meta, calibration_incomplete)` taken
+    /// right before `WizardStarted` re-keys those fields onto a newly
+    /// noticed device (see `device_changed_note`). `Some` for the duration of
+    /// a wizard that started on a changed device; `teardown_wizard`'s
+    /// discard paths restore it (the engine never actually switched devices,
+    /// so a cancelled wizard must leave the meter/slider keyed to what the
+    /// engine is still listening to), while the finish path
+    /// (`apply_calibration`) clears it without restoring, since the new
+    /// device's calibration was genuinely applied under the new name.
+    pre_wizard_device: Option<(String, TuningMeta, bool)>,
     /// The `Measuring` step's progress value as of the last time it actually
     /// changed (either a fresh `Progress` event, or the last `Tick` that
     /// noticed a change) — compared against on every `Tick` to detect a
@@ -432,6 +443,7 @@ impl App {
                 autostart_error: None,
                 wizard_error: None,
                 device_changed_note: false,
+                pre_wizard_device: None,
                 measure_progress_seen: 0.0,
                 measure_stalled_ticks: 0,
                 cpu_sample: None,
@@ -649,6 +661,16 @@ impl App {
                 let current = audio::default_input_name().unwrap_or_else(|| "unknown input".into());
                 self.device_changed_note = current != self.device_name;
                 if self.device_changed_note {
+                    // The engine keeps running on the original device (see
+                    // the comment on `device_changed_note` above); only the
+                    // meter's markers and the sensitivity slider re-key to
+                    // the new one. Stash what they were keyed to so a
+                    // cancelled/discarded wizard can put them back — without
+                    // this, one slider nudge after a cancelled wizard would
+                    // send anchors for a device the engine isn't listening
+                    // to.
+                    self.pre_wizard_device =
+                        Some((self.device_name.clone(), self.tuning_meta, self.calibration_incomplete));
                     self.device_name = current;
                     self.refresh_device_meta();
                 }
@@ -912,6 +934,26 @@ impl App {
             let result = *result;
             self.apply_calibration(result);
         }
+        // A device-changed wizard re-keyed `device_name`/`tuning_meta`/
+        // `calibration_incomplete` onto the newly noticed device at
+        // `WizardStarted` (see `pre_wizard_device`). If that wasn't just
+        // applied above (`apply_calibration` clears the stash on the way
+        // out), the wizard is being discarded — cancel, restart, or a window
+        // close/Quit that caught it mid-run — so the engine is still running
+        // on the *original* device and these fields must go back to
+        // matching it, or the next slider nudge sends anchors for a device
+        // nothing is listening to.
+        if let Some((device_name, tuning_meta, calibration_incomplete)) = self.pre_wizard_device.take() {
+            self.device_name = device_name;
+            self.tuning_meta = tuning_meta;
+            self.calibration_incomplete = calibration_incomplete;
+            let icon = if self.enabled && self.stream.is_some() {
+                self.active_icons().for_state(self.latest_tray_state)
+            } else {
+                self.active_icons().off.clone()
+            };
+            let _ = self.tray.set_icon(Some(icon));
+        }
         self.cancel_wizard();
         let _ = self.commands.send(Command::SetWizardActive(false));
     }
@@ -945,6 +987,13 @@ impl App {
         // finished calibration must survive even if the app never reaches a
         // commit point.
         let _ = self.config.save();
+
+        // A device-changed wizard's pre-wizard snapshot (see
+        // `pre_wizard_device`) exists only to be restored if the wizard gets
+        // discarded; this is being applied instead — under `self.device_name`,
+        // which `WizardStarted` already re-keyed to the new device — so the
+        // old device's snapshot is simply dropped rather than restored.
+        self.pre_wizard_device = None;
 
         // Recompute the dot/banner flag and repaint the tray immediately —
         // a calibration finishing must not wait for the next state change to
@@ -980,6 +1029,17 @@ impl App {
         let (meta, incomplete) = device_meta(&self.config, &self.device_name);
         self.tuning_meta = meta;
         self.calibration_incomplete = incomplete;
+
+        // `calibration_incomplete` just changed (possibly): repaint the tray
+        // immediately, mirroring `apply_calibration`'s icon selection,
+        // rather than leaving the dot stale until the next unrelated state
+        // change happens to trigger a repaint.
+        let icon = if self.enabled && self.stream.is_some() {
+            self.active_icons().for_state(self.latest_tray_state)
+        } else {
+            self.active_icons().off.clone()
+        };
+        let _ = self.tray.set_icon(Some(icon));
     }
 
     /// Whether the wizard's `Measuring` step should show the "waiting to
