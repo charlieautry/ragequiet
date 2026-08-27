@@ -12,6 +12,7 @@ pub enum CalibrationState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
 pub struct DeviceCalibration {
     pub state: CalibrationState,
     pub quiet_db: f32,
@@ -19,6 +20,20 @@ pub struct DeviceCalibration {
     pub ceiling_db: Option<f32>,
     pub noise_floor_db: f32,
     pub sensitivity: f32,
+}
+
+impl Default for DeviceCalibration {
+    /// Intentionally-invalid sentinel: a half-parsed entry (missing fields)
+    /// must behave as uncalibrated rather than inventing a calibration.
+    fn default() -> Self {
+        Self {
+            state: CalibrationState::BaselineOnly,
+            quiet_db: f32::NAN,
+            ceiling_db: None,
+            noise_floor_db: f32::NAN,
+            sensitivity: 0.5,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -37,13 +52,60 @@ impl Default for Config {
 }
 
 impl DeviceCalibration {
+    /// The single boundary between persisted values and the engine: anything
+    /// non-finite or out of range degrades to uncalibrated defaults instead of
+    /// poisoning detection (config files get hand-edited).
     pub fn tuning(&self) -> crate::engine::Tuning {
+        let defaults = crate::engine::Tuning::default();
+        if !self.quiet_db.is_finite() || !self.noise_floor_db.is_finite() {
+            return defaults;
+        }
+        let sensitivity = if self.sensitivity.is_finite() {
+            self.sensitivity.clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let ceiling_db = self
+            .ceiling_db
+            .filter(|c| c.is_finite() && crate::engine::calibrate::ceiling_is_sane(self.quiet_db, *c));
         crate::engine::Tuning {
             noise_floor_db: self.noise_floor_db,
             quiet_db: Some(self.quiet_db),
-            ceiling_db: self.ceiling_db,
-            sensitivity: self.sensitivity,
+            ceiling_db,
+            sensitivity,
         }
+    }
+}
+
+/// Load-time mirror of `Config` where each calibration entry is still raw
+/// TOML; this lets one malformed device entry fail on its own without
+/// dragging down `hold_ms`/`cooldown_ms` or other devices' calibration.
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct RawConfig {
+    hold_ms: u64,
+    cooldown_ms: u64,
+    calibration: BTreeMap<String, toml::Value>,
+}
+
+impl Default for RawConfig {
+    fn default() -> Self {
+        let d = Config::default();
+        Self { hold_ms: d.hold_ms, cooldown_ms: d.cooldown_ms, calibration: BTreeMap::new() }
+    }
+}
+
+impl RawConfig {
+    fn into_config(self) -> Config {
+        let calibration = self
+            .calibration
+            .into_iter()
+            .map(|(name, value)| {
+                let cal = DeviceCalibration::deserialize(value).unwrap_or_default();
+                (name, cal)
+            })
+            .collect();
+        Config { hold_ms: self.hold_ms, cooldown_ms: self.cooldown_ms, calibration }
     }
 }
 
@@ -54,10 +116,15 @@ impl Config {
     }
 
     /// Missing or unreadable/corrupt file yields defaults; the app must always start.
+    /// A single malformed `[calibration."device"]` entry must not discard the
+    /// rest of the file (global settings, other devices), so calibration
+    /// entries are parsed leniently: a bad entry falls back to the
+    /// uncalibrated sentinel rather than failing the whole document.
     pub fn load_from(path: &Path) -> Self {
         std::fs::read_to_string(path)
             .ok()
-            .and_then(|s| toml::from_str(&s).ok())
+            .and_then(|s| toml::from_str::<RawConfig>(&s).ok())
+            .map(RawConfig::into_config)
             .unwrap_or_default()
     }
 
@@ -144,6 +211,78 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"baseline_only\""), "got: {text}");
         assert!(!text.contains("ceiling_db"), "None ceiling must be omitted: {text}");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn nan_and_inf_calibration_yields_uncalibrated_tuning() {
+        let cal = DeviceCalibration {
+            state: CalibrationState::CeilingSet,
+            quiet_db: f32::NAN,
+            ceiling_db: Some(f32::INFINITY),
+            noise_floor_db: -58.0,
+            sensitivity: 0.5,
+        };
+        let t = cal.tuning();
+        assert!(t.quiet_db.is_none(), "non-finite quiet point must fall back to uncalibrated");
+        assert!(t.noise_floor_db.is_finite());
+    }
+
+    #[test]
+    fn sensitivity_is_clamped_to_unit_range() {
+        let mut cal = DeviceCalibration {
+            state: CalibrationState::CeilingSet,
+            quiet_db: -37.0,
+            ceiling_db: Some(-17.0),
+            noise_floor_db: -58.0,
+            sensitivity: 5.0,
+        };
+        assert_eq!(cal.tuning().sensitivity, 1.0);
+        cal.sensitivity = -2.0;
+        assert_eq!(cal.tuning().sensitivity, 0.0);
+        cal.sensitivity = f32::NAN;
+        assert_eq!(cal.tuning().sensitivity, 0.5);
+    }
+
+    #[test]
+    fn insane_ceiling_is_dropped_not_fatal() {
+        let cal = DeviceCalibration {
+            state: CalibrationState::CeilingSet,
+            quiet_db: -37.0,
+            ceiling_db: Some(-50.0), // "ceiling" quieter than quiet point
+            noise_floor_db: -58.0,
+            sensitivity: 0.5,
+        };
+        let t = cal.tuning();
+        assert_eq!(t.quiet_db, Some(-37.0), "quiet point survives");
+        assert!(t.ceiling_db.is_none(), "inverted ceiling must be discarded");
+    }
+
+    #[test]
+    fn bare_nan_in_file_does_not_kill_detection() {
+        let path = temp_config_path("nanfile");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "hold_ms = 300\ncooldown_ms = 3000\n\n[calibration.\"Mic\"]\nstate = \"baseline_only\"\nquiet_db = nan\nnoise_floor_db = -58.0\nsensitivity = 0.5\n").unwrap();
+        let cfg = Config::load_from(&path);
+        assert_eq!(cfg.hold_ms, 300);
+        let t = cfg.calibration.get("Mic").expect("entry must survive parsing").tuning();
+        assert!(t.quiet_db.is_none(), "NaN quiet point must yield uncalibrated tuning");
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn partial_device_entry_does_not_discard_the_config() {
+        let path = temp_config_path("partial");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "hold_ms = 450\n\n[calibration.\"Good\"]\nstate = \"ceiling_set\"\nquiet_db = -34.0\nceiling_db = -18.0\nnoise_floor_db = -58.0\nsensitivity = 0.5\n\n[calibration.\"Bad\"]\nstate = \"baseline_only\"\n").unwrap();
+        let cfg = Config::load_from(&path);
+        assert_eq!(cfg.hold_ms, 450, "global settings must survive a bad device entry");
+        assert_eq!(cfg.calibration.get("Good").map(|c| c.quiet_db), Some(-34.0));
+        // the Bad entry either parses with harmless defaults or is dropped; it
+        // must not produce a calibrated tuning either way
+        if let Some(bad) = cfg.calibration.get("Bad") {
+            assert!(bad.tuning().quiet_db.is_none());
+        }
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

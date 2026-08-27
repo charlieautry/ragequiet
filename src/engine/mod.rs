@@ -1,5 +1,4 @@
 pub mod baseline;
-#[allow(dead_code)] // used from the wizard UI on
 pub mod calibrate;
 pub mod features;
 pub mod vad;
