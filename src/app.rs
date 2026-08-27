@@ -72,6 +72,11 @@ pub struct App {
     pub(crate) latest: (f32, f32, f32),
     /// Last tray state seen, for the settings window's status line.
     pub(crate) latest_tray_state: TrayState,
+    /// True once a `*Changed` message has edited `config` since the last save
+    /// (slider release, or a non-drag edit like Ctrl+scroll/arrow keys that
+    /// never fires `on_release`); `commit_config` is the only place this is
+    /// cleared.
+    config_dirty: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +207,7 @@ impl App {
                 icons,
                 latest: (-100.0, f32::NAN, -100.0),
                 latest_tray_state: TrayState::Quiet,
+                config_dirty: false,
             },
             Task::none(), // no window at launch: the app lives in the tray
         )
@@ -250,6 +256,7 @@ impl App {
                 if self.settings_window == Some(id) {
                     self.settings_window = None;
                 }
+                self.commit_config();
                 Task::none()
             }
             Message::Tick => {
@@ -265,16 +272,19 @@ impl App {
                     let tuning = entry.tuning();
                     let _ = self.commands.send(Command::SetTuning(tuning));
                     self.tuning_meta.sensitivity = tuning.sensitivity;
+                    self.config_dirty = true;
                 }
                 Task::none()
             }
             Message::HoldChanged(hold_ms) => {
                 self.config.hold_ms = hold_ms;
+                self.config_dirty = true;
                 self.send_gate();
                 Task::none()
             }
             Message::CooldownChanged(cooldown_ms) => {
                 self.config.cooldown_ms = cooldown_ms;
+                self.config_dirty = true;
                 self.send_gate();
                 Task::none()
             }
@@ -293,10 +303,13 @@ impl App {
                 None => Task::none(),
             },
             Message::SettingsCommitted => {
-                let _ = self.config.save();
+                self.commit_config();
                 Task::none()
             }
-            Message::Quit => iced::exit(),
+            Message::Quit => {
+                self.commit_config();
+                iced::exit()
+            }
         }
     }
 
@@ -377,6 +390,18 @@ impl App {
     /// since none exists.
     pub(crate) fn has_stream(&self) -> bool {
         self.stream.is_some()
+    }
+
+    /// Writes `config` to disk exactly once per dirty edit, regardless of
+    /// which of the three commit points (slider release, window close, quit)
+    /// triggers it — covers slider edits made without a drag gesture (Ctrl+
+    /// scroll, arrow keys), which iced 0.14 applies live but never fires
+    /// `on_release` for.
+    fn commit_config(&mut self) {
+        if self.config_dirty {
+            let _ = self.config.save();
+            self.config_dirty = false;
+        }
     }
 }
 
