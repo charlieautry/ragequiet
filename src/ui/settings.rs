@@ -90,14 +90,13 @@ pub fn view(app: &App) -> Element<'_, Message> {
     // The default controls stack (no banner, no wizard error) fits inside the
     // 400x760 window on its own — meter/status/alerts/sensitivity/hold/
     // cooldown/sound/volume/output-device/test-mode/autostart/input/CPU is 13
-    // rows at 12px spacing, comfortably under the ~660px available once the
-    // chrome row, container padding, and content-column spacing are
-    // subtracted. This scrollable is a safety net, not the primary layout: if
-    // a banner, wrapped alert copy, or a long device name ever pushes the
-    // body past the fold anyway, every control (including Cancel/Finish)
-    // still stays reachable instead of clipping. The chrome row lives outside
-    // this scrollable so the window stays movable/closable no matter how tall
-    // the body gets.
+    // rows at 12px spacing, comfortably under the ~680px available once the
+    // chrome bar and body padding are subtracted. This scrollable is a safety
+    // net, not the primary layout: if a banner, wrapped alert copy, or a long
+    // device name ever pushes the body past the fold anyway, every control
+    // (including Cancel/Finish) still stays reachable instead of clipping.
+    // The chrome row lives outside this scrollable so the window stays
+    // movable/closable no matter how tall the body gets.
     let scrollable_body = scrollable(body)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -106,19 +105,28 @@ pub fn view(app: &App) -> Element<'_, Message> {
         ))
         .style(scrollbar_style);
 
-    let content = column![chrome_row(), scrollable_body]
-        .spacing(16)
-        .width(Length::Fill)
-        .height(Length::Fill);
-
-    let window_body = container(content)
+    // The body's own padding: tighter than the old uniform 24px on every
+    // side (14 horizontal, 12 on top — the bottom edge gets a touch more,
+    // 14, to balance the scrollbar's margin). The chrome bar below is
+    // full-bleed and carries none of this, so it isn't inset from the
+    // window edges the way the body is.
+    let body_container = container(scrollable_body)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(24)
-        .style(|_theme: &Theme| container::Style {
-            background: Some(BACKGROUND.into()),
-            ..container::Style::default()
-        });
+        .padding(iced::Padding { top: 12.0, right: 14.0, bottom: 14.0, left: 14.0 });
+
+    // No spacing here: the chrome bar spans edge-to-edge and the body's own
+    // top padding (above) is what separates it from the bar, so the bar's
+    // padding is the only "gap" above the title and it's inside the drag
+    // mouse_area, not dead space outside it.
+    let content = column![chrome_row(), body_container].width(Length::Fill).height(Length::Fill);
+
+    // No padding here either — the chrome bar must reach every window edge
+    // for the drag mouse_area (which fills the bar) to be full-bleed. The
+    // body's own padding above provides all of the interior breathing room.
+    let window_body = container(content).width(Length::Fill).height(Length::Fill).style(
+        |_theme: &Theme| container::Style { background: Some(BACKGROUND.into()), ..container::Style::default() },
+    );
 
     // Invisible edge/corner strips layered over everything so the window can
     // still be resized (see `resize_handles`'s doc comment for why the OS's
@@ -193,24 +201,35 @@ fn resize_handles<'a>() -> Element<'a, Message> {
 /// The custom title bar: draggable title region on the left, flat close
 /// button on the right. Borderless windows (`decorations: false`) have no
 /// native chrome, so this row is the only way to move or close the window.
+///
+/// This bar is full-bleed (no outer padding of its own — see `view`), and
+/// the padding that visually surrounds the title lives *inside* the drag
+/// `mouse_area` rather than around it. That's deliberate: previously the
+/// window's outer container padding sat around this row too, so the space
+/// above/left of the title looked draggable but wasn't. Now every pixel of
+/// the top band — except the ✕ button and the 6px resize strips the stack
+/// overlays on the very edges (see `resize_handles`) — is inside the
+/// mouse_area and drags the window.
 fn chrome_row<'a>() -> Element<'a, Message> {
     let title = text("Ragequiet").font(FONT_SEMIBOLD).size(14).color(TEXT);
 
-    // Only the title + spacer is draggable; the close button must stay
-    // clickable rather than starting a window drag.
-    let drag_region = mouse_area(row![title, space::horizontal()].align_y(Alignment::Center).width(Length::Fill))
-        .on_press(Message::DragWindow);
+    // The padding here (10 top/bottom, 14 left, 0 right so the spacer runs
+    // flush to the close button) is inside the mouse_area, not outside it.
+    let drag_region = mouse_area(
+        container(row![title, space::horizontal()].align_y(Alignment::Center))
+            .width(Length::Fill)
+            .padding(iced::Padding { top: 10.0, right: 0.0, bottom: 10.0, left: 14.0 }),
+    )
+    .on_press(Message::DragWindow);
 
+    // The close button carries its own (larger) padding so its hit target
+    // stays comfortable even though the bar around it lost its outer inset.
     let close = button(text("✕").size(14))
-        .padding([2.0, 8.0])
+        .padding([10.0, 14.0])
         .style(close_button_style)
         .on_press(Message::CloseSettings);
 
-    row![drag_region, close]
-        .align_y(Alignment::Center)
-        .width(Length::Fill)
-        .height(Length::Fixed(36.0))
-        .into()
+    row![drag_region, close].align_y(Alignment::Center).width(Length::Fill).into()
 }
 
 /// Inline notice shown when the tray "Recalibrate"/banner Calibrate buttons
