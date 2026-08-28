@@ -5,6 +5,10 @@
 
 Beeps at you when you get too loud while gaming. Native Rust, sits in your tray, ~0% CPU, works no matter where your mic is.
 
+<img src="assets/media/tray-demo-4x.gif" alt="tray icon turning from green to red as the voice gets louder" width="102">
+
+*The tray icon reacting to a raised voice.*
+
 ## Why
 
 Somebody's asleep in the next room and you keep forgetting how loud you get mid-game. Most "mic level" tools trigger on an absolute volume threshold, so they break the moment you move your headset, swap microphones, or sit closer to the desk. Ragequiet calibrates to *your* voice at *your* setup instead of a fixed number, and it keeps adapting so a change in gain or mic position doesn't mean recalibrating from scratch.
@@ -21,7 +25,7 @@ Somebody's asleep in the next room and you keep forgetting how loud you get mid-
 - Test mode to preview detection and alerts without waiting for a real trigger
 - Sensitivity slider
 - Optional start with Windows
-- Single instance — launching it twice just focuses the existing tray icon
+- Single instance — a second launch exits quietly instead of duplicating the tray icon
 
 ## Install
 
@@ -35,18 +39,16 @@ There's no installer — it's a single exe. No services, no background installer
 
 ## First run
 
-The tray icon appears as soon as it starts. Right-click it and choose **Recalibrate** to run the setup wizard (about a minute). The wizard asks for a few seconds of quiet — your normal room/game background — and then a few seconds of you talking at a volume you'd consider "too loud." The loud step can be skipped late at night; ragequiet will fall back to a reasonable default until you calibrate it properly later.
+On the very first launch, the setup wizard opens automatically (about a minute). After that, ragequiet lives in the tray — right-click the icon and choose **Recalibrate** any time you switch microphones or want to redo setup. The wizard asks for a few seconds of quiet — your normal room/game background — and then a few seconds of you talking at a volume you'd consider "too loud." The loud step can be skipped late at night; ragequiet will fall back to a reasonable default until you calibrate it properly later.
 
 ## Performance
 
 - 0% CPU when idle with no window open
-- ~17 MB memory while sitting in the tray (opening the settings window adds roughly 5 MB while it's open)
+- ~17 MB working set while sitting in the tray — Task Manager's default memory column reports about 7.5 MB (opening the settings window adds roughly 5 MB while it's open)
 - Single ~8.4 MB exe, no installer, no services
 - No telemetry, no network access at all — audio never leaves the machine
 
-<!-- screenshot: task manager showing 0% CPU -->
-
-*(A short demo GIF is coming.)*
+![Task Manager showing ragequiet at 0% CPU and 7.5 MB memory](assets/media/task-manager-0-cpu.png)
 
 ## Uninstall
 
