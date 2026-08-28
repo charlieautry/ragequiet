@@ -5,9 +5,10 @@ use std::path::{Path, PathBuf};
 
 use crate::sounds::BuiltinSound;
 
-/// The alert sound the app plays on a beep: one of the six synthesized
-/// built-ins, or a user-chosen file decoded at boot/selection time (see
-/// `src/decode.rs`). On-disk shape (externally tagged, snake_case variant
+/// The alert sound the app plays on a beep: one of the twelve built-ins
+/// (three synthesized, nine recorded — see `src/sounds.rs`), or a
+/// user-chosen file decoded at boot/selection time (see `src/decode.rs`).
+/// On-disk shape (externally tagged, snake_case variant
 /// names): `alert_sound = { builtin = "soft_beep" }` or
 /// `alert_sound = { custom = { path = "C:/.../ding.wav" } }`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -136,7 +137,12 @@ struct RawConfig {
     cooldown_ms: u64,
     calibration: BTreeMap<String, toml::Value>,
     banner_dismissed_on: Option<String>,
-    alert_sound: AlertSound,
+    /// Raw TOML rather than `AlertSound` directly: the set of built-in
+    /// sound names has changed release to release (see `BuiltinSound`), so
+    /// an old config naming a since-removed variant (e.g. `"boing"`) must
+    /// fall back to the default sound instead of failing the whole
+    /// document — same lenient-entry precedent as `calibration` above.
+    alert_sound: Option<toml::Value>,
     alert_volume: f32,
     output_device: Option<String>,
     start_with_windows: bool,
@@ -150,7 +156,7 @@ impl Default for RawConfig {
             cooldown_ms: d.cooldown_ms,
             calibration: BTreeMap::new(),
             banner_dismissed_on: None,
-            alert_sound: d.alert_sound,
+            alert_sound: None,
             alert_volume: d.alert_volume,
             output_device: d.output_device,
             start_with_windows: d.start_with_windows,
@@ -168,12 +174,16 @@ impl RawConfig {
                 (name, cal)
             })
             .collect();
+        let alert_sound = self
+            .alert_sound
+            .map(|v| AlertSound::deserialize(v).unwrap_or_default())
+            .unwrap_or_default();
         Config {
             hold_ms: self.hold_ms,
             cooldown_ms: self.cooldown_ms,
             calibration,
             banner_dismissed_on: self.banner_dismissed_on,
-            alert_sound: self.alert_sound,
+            alert_sound,
             alert_volume: self.alert_volume,
             output_device: self.output_device,
             start_with_windows: self.start_with_windows,
@@ -480,6 +490,35 @@ mod alert_tests {
         assert_eq!(cfg.alert_volume, 0.8);
         assert_eq!(cfg.output_device, None);
         assert!(!cfg.start_with_windows);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// A config saved by an older build naming a since-removed built-in
+    /// (`"boing"`, `"knock"`) must not nuke the whole file: `alert_sound`
+    /// falls back to the default while every other field survives intact.
+    #[test]
+    fn removed_builtin_variant_falls_back_to_default_and_preserves_the_rest() {
+        let path = temp_config_path("removed-variant");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            "hold_ms = 450\ncooldown_ms = 5000\nalert_volume = 0.4\n\n[alert_sound]\nbuiltin = \"boing\"\n",
+        )
+        .unwrap();
+        let cfg = Config::load_from(&path);
+        assert_eq!(cfg.alert_sound, AlertSound::Builtin(BuiltinSound::SoftBeep));
+        assert_eq!(cfg.hold_ms, 450, "unrelated global settings must survive");
+        assert_eq!(cfg.cooldown_ms, 5000);
+        assert_eq!(cfg.alert_volume, 0.4);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn newly_added_builtin_variant_round_trips() {
+        let path = temp_config_path("gong");
+        let cfg = Config { alert_sound: AlertSound::Builtin(BuiltinSound::Gong), ..Config::default() };
+        cfg.save_to(&path).unwrap();
+        assert_eq!(Config::load_from(&path), cfg);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

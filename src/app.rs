@@ -53,29 +53,41 @@ struct MenuIds {
     quit: MenuId,
 }
 
-/// All six built-in alert sounds, rendered once at boot so a play request is
-/// just an `Arc` clone rather than re-synthesizing samples on every alert.
+/// All twelve built-in alert sounds, rendered/decoded once at boot so a play
+/// request is just an `Arc` clone rather than re-synthesizing or
+/// re-decoding on every alert. Each entry keeps its own sample rate: the
+/// three synth sounds are `sounds::SOUND_RATE`, and the embedded WAVs are
+/// expected to be `SOUND_RATE` too (they're 48kHz assets), but the cache
+/// stores whatever `decode_bytes` actually reports rather than assuming.
 struct SoundCache {
-    entries: [(BuiltinSound, Arc<Vec<f32>>); sounds::ALL.len()],
+    entries: [(BuiltinSound, Arc<Vec<f32>>, u32); sounds::ALL.len()],
 }
 
 impl SoundCache {
     fn render_all() -> Self {
         Self {
-            entries: sounds::ALL.map(|s| (s, Arc::new(sounds::render(s)))),
+            entries: sounds::ALL.map(|s| match s.data() {
+                sounds::SoundData::Synth(_) => (s, Arc::new(sounds::render(s)), sounds::SOUND_RATE),
+                sounds::SoundData::Wav(bytes) => {
+                    let (samples, rate) = decode::decode_bytes(bytes, Some("wav"))
+                        .unwrap_or_else(|e| panic!("embedded sound asset {s:?} failed to decode: {e}"));
+                    (s, Arc::new(samples), rate)
+                }
+            }),
         }
     }
 
-    fn get(&self, sound: BuiltinSound) -> Arc<Vec<f32>> {
+    /// Samples plus the rate they were recorded/synthesized at.
+    fn get(&self, sound: BuiltinSound) -> (Arc<Vec<f32>>, u32) {
         self.entries
             .iter()
-            .find(|(s, _)| *s == sound)
-            .map(|(_, samples)| Arc::clone(samples))
+            .find(|(s, _, _)| *s == sound)
+            .map(|(_, samples, rate)| (Arc::clone(samples), *rate))
             .expect("SoundCache::render_all covers every BuiltinSound")
     }
 }
 
-/// One entry in the settings window's "Alert sound" `pick_list`: the six
+/// One entry in the settings window's "Alert sound" `pick_list`: the twelve
 /// built-ins plus a "Custom…" entry that (when picked) opens the file
 /// dialog rather than selecting a sound directly. `Custom(Some(name))` is
 /// never an option in the list itself — it only ever appears as the picker's
@@ -162,7 +174,7 @@ pub struct App {
     /// Session-only dismissal of the drift-staleness nudge; never resets
     /// (unlike the once-per-day banner, which tracks a date).
     pub(crate) drift_nudge_dismissed: bool,
-    /// All six built-in sounds, rendered once at boot.
+    /// All twelve built-in sounds, rendered/decoded once at boot.
     sounds: SoundCache,
     /// Owns the alert output stream's lifecycle on its own thread; `Beeped`
     /// hands it play requests and never blocks.
@@ -1062,10 +1074,10 @@ impl App {
     /// silent just because a file went missing.
     pub(crate) fn current_sound(&self) -> (Arc<Vec<f32>>, u32) {
         match &self.config.alert_sound {
-            AlertSound::Builtin(b) => (self.sounds.get(*b), sounds::SOUND_RATE),
+            AlertSound::Builtin(b) => self.sounds.get(*b),
             AlertSound::Custom { .. } => match &self.custom_sound {
                 Some(samples) => (Arc::clone(samples), self.custom_sound_rate),
-                None => (self.sounds.get(BuiltinSound::SoftBeep), sounds::SOUND_RATE),
+                None => self.sounds.get(BuiltinSound::SoftBeep),
             },
         }
     }

@@ -13,7 +13,7 @@ use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, TrackType};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 
 /// Longer than this, an alert sound is truncated rather than rejected — a
@@ -26,10 +26,23 @@ const MAX_DURATION: Duration = Duration::from_secs(10);
 /// audio at all.
 pub fn decode_file(path: &Path) -> anyhow::Result<(Vec<f32>, u32)> {
     let file = File::open(path).with_context(|| format!("could not open {}", path.display()))?;
-    let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    let ext = path.extension().and_then(|e| e.to_str()).map(str::to_string);
+    decode_source(Box::new(file), ext.as_deref())
+}
+
+/// Decodes an in-memory audio buffer (WAV/MP3) the same way [`decode_file`]
+/// decodes a file — used for the sound pack embedded via `include_bytes!` in
+/// `src/sounds.rs`. `hint_ext` (e.g. `Some("wav")`) helps the format prober
+/// the same way a file extension does; pass `None` if unknown.
+pub fn decode_bytes(bytes: &'static [u8], hint_ext: Option<&str>) -> anyhow::Result<(Vec<f32>, u32)> {
+    decode_source(Box::new(std::io::Cursor::new(bytes)), hint_ext)
+}
+
+fn decode_source(source: Box<dyn MediaSource>, hint_ext: Option<&str>) -> anyhow::Result<(Vec<f32>, u32)> {
+    let mss = MediaSourceStream::new(source, Default::default());
 
     let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+    if let Some(ext) = hint_ext {
         hint.with_extension(ext);
     }
 
@@ -87,7 +100,7 @@ pub fn decode_file(path: &Path) -> anyhow::Result<(Vec<f32>, u32)> {
     }
 
     if samples.is_empty() {
-        anyhow::bail!("no audio samples decoded from {}", path.display());
+        anyhow::bail!("no audio samples decoded");
     }
 
     Ok((samples, sample_rate))

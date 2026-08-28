@@ -398,7 +398,7 @@ fn cooldown_block(app: &App) -> Element<'_, Message> {
     column![header, control].spacing(6).into()
 }
 
-/// "Alert sound" picker: the six built-ins plus a "Custom…" entry that opens
+/// "Alert sound" picker: the twelve built-ins plus a "Custom…" entry that opens
 /// the file dialog; a chosen custom file's name becomes the closed control's
 /// display text (see `SoundChoice`/`App::sound_choice`). A **Test** button
 /// alongside it plays the current selection through the configured device.
