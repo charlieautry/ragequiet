@@ -78,6 +78,12 @@ pub struct Config {
     /// `None` = the system default output device.
     #[serde(default)]
     pub output_device: Option<String>,
+    /// `None` = follow the system default input device (which the stream is
+    /// rebuilt onto whenever it moves — see `App::build_audio`). `Some(name)`
+    /// pins a specific device, falling back to the default while that device
+    /// isn't present.
+    #[serde(default)]
+    pub input_device: Option<String>,
     /// Mirrors the user's last intent for launch-at-login. The registry
     /// (`autostart::autostart_enabled()`) is the runtime source of truth;
     /// this field only exists so the setting round-trips through the config
@@ -96,6 +102,7 @@ impl Default for Config {
             alert_sound: AlertSound::default(),
             alert_volume: 0.8,
             output_device: None,
+            input_device: None,
             start_with_windows: false,
         }
     }
@@ -145,6 +152,7 @@ struct RawConfig {
     alert_sound: Option<toml::Value>,
     alert_volume: f32,
     output_device: Option<String>,
+    input_device: Option<String>,
     start_with_windows: bool,
 }
 
@@ -159,6 +167,7 @@ impl Default for RawConfig {
             alert_sound: None,
             alert_volume: d.alert_volume,
             output_device: d.output_device,
+            input_device: d.input_device,
             start_with_windows: d.start_with_windows,
         }
     }
@@ -186,6 +195,7 @@ impl RawConfig {
             alert_sound,
             alert_volume: self.alert_volume,
             output_device: self.output_device,
+            input_device: self.input_device,
             start_with_windows: self.start_with_windows,
         }
     }
@@ -519,6 +529,38 @@ mod alert_tests {
         let cfg = Config { alert_sound: AlertSound::Builtin(BuiltinSound::Gong), ..Config::default() };
         cfg.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path), cfg);
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn default_input_device_is_the_system_default() {
+        assert_eq!(Config::default().input_device, None);
+    }
+
+    #[test]
+    fn input_device_round_trips() {
+        let path = temp_config_path("input-device");
+        let cfg = Config {
+            input_device: Some("Headset Microphone (Realtek)".to_string()),
+            ..Config::default()
+        };
+        cfg.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path);
+        assert_eq!(loaded, cfg);
+        assert_eq!(loaded.input_device.as_deref(), Some("Headset Microphone (Realtek)"));
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    /// A config written before this field existed must keep meaning "system
+    /// default" rather than failing the document.
+    #[test]
+    fn missing_input_device_defaults_to_none() {
+        let path = temp_config_path("no-input-device");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "hold_ms = 450\ncooldown_ms = 3000\n").unwrap();
+        let cfg = Config::load_from(&path);
+        assert_eq!(cfg.input_device, None);
+        assert_eq!(cfg.hold_ms, 450);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 

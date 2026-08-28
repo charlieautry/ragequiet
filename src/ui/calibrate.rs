@@ -218,38 +218,36 @@ fn instruction(kind: MeasurementKind) -> &'static str {
 /// The wizard body, rendered under the settings window's chrome row in place
 /// of the normal controls. `meter` is the same live meter canvas the settings
 /// view builds, passed in so the user watches their own level while
-/// calibrating (and so this stays free of `App`). `monitoring_paused` and
-/// `stall_hint` only affect the `Measuring` step (see the muted lines under
-/// its progress bar); `device_changed` only affects `Intro`'s note.
+/// calibrating (and so this stays free of `App`); `input_picker` is the
+/// settings view's "Input device" block, passed in the same way.
+/// `monitoring_paused` and `stall_hint` only affect the `Measuring` step (see
+/// the muted lines under its progress bar).
+///
+/// The picker is rendered on `Intro` and nowhere else. That's structural, not
+/// stylistic: switching devices rebuilds the audio stream, which is only safe
+/// before a measurement has started, and `Intro` is the one step where none
+/// has. Every later step simply drops it.
 pub fn view<'a>(
     wizard: &Wizard,
     meter: Element<'a, Message>,
+    input_picker: Element<'a, Message>,
     monitoring_paused: bool,
     stall_hint: bool,
-    device_changed: bool,
 ) -> Element<'a, Message> {
     let content: Element<'a, Message> = match &wizard.step {
-        WizardStep::Intro => {
-            let mut block = column![
-                heading("Calibrate for this mic"),
-                body_text(
-                    "Takes under a minute: three seconds of silence, then two short voice \
-                     samples. Ragequiet learns what quiet and loud sound like on this \
-                     microphone so it only nudges you when you're actually too loud."
-                ),
-            ]
-            .spacing(16);
-            if device_changed {
-                block = block.push(body_text(
-                    "Note: the default microphone changed since launch. Restart the app \
-                     to capture from the new one.",
-                ));
-            }
-            block
-                .push(meter)
-                .push(buttons(vec![primary("Start", Message::WizardEvent(WizardEvent::Begin))]))
-                .into()
-        }
+        WizardStep::Intro => column![
+            heading("Calibrate for this mic"),
+            body_text(
+                "Takes under a minute: three seconds of silence, then two short voice \
+                 samples. Ragequiet learns what quiet and loud sound like on this \
+                 microphone so it only nudges you when you're actually too loud."
+            ),
+            input_picker,
+            meter,
+            buttons(vec![primary("Start", Message::WizardEvent(WizardEvent::Begin))]),
+        ]
+        .spacing(16)
+        .into(),
 
         WizardStep::Measuring { kind, progress } => {
             let mut block = column![
@@ -427,7 +425,10 @@ fn primary_button_style(_theme: &Theme, status: button::Status) -> button::Style
     }
 }
 
-fn secondary_button_style(_theme: &Theme, status: button::Status) -> button::Style {
+/// The wizard's secondary (Skip/Discard) button look, also used by the
+/// settings view's Recalibrate button so the two read as the same weight of
+/// action rather than two near-identical styles drifting apart.
+pub(crate) fn secondary_button_style(_theme: &Theme, status: button::Status) -> button::Style {
     let text_color = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
         TEXT
     } else {

@@ -43,6 +43,11 @@ enum AudioEvent {
 /// unconditionally present in `subscription()`'s batch, since a second claim
 /// attempt (e.g. from a subscription that toggles on/off) would find `None`
 /// and silently never receive audio events.
+///
+/// Rebuilding the input stream leaves this side untouched: the same receiver
+/// keeps serving whichever callback is live, because each one is handed a
+/// fresh *clone* of the sender (`App::audio_events_tx`) rather than the
+/// sender itself.
 static AUDIO_EVENTS: Mutex<Option<Receiver<AudioEvent>>> = Mutex::new(None);
 
 /// Menu item ids captured at build time; menu events only carry ids.
@@ -143,8 +148,19 @@ pub struct App {
     pub(crate) test_mode: bool,
     pub(crate) config: Config,
     pub(crate) device_name: String,
+    /// The meter's lock-free readouts. Retained across stream rebuilds (every
+    /// new callback gets a clone of *this* `Arc`), so the UI's snapshot path
+    /// keeps working through a device switch.
     shared: Arc<SharedLevels>,
+    /// Sender for the current callback's command channel; replaced by every
+    /// `build_audio` (the old channel dies with the old stream).
     commands: CommandTx,
+    /// The master clone of the audio-events sender. Every callback gets its
+    /// own clone from here rather than the sender being moved into the first
+    /// one, so a rebuilt stream can still reach the (take-once) receiver
+    /// parked in `AUDIO_EVENTS`; holding one here also keeps that receiver's
+    /// thread alive across the moment where no stream exists.
+    audio_events_tx: std::sync::mpsc::Sender<AudioEvent>,
     /// None when the input device could not be opened; the app still runs.
     stream: Option<cpal::Stream>,
     pub(crate) tuning_meta: TuningMeta,
@@ -194,6 +210,10 @@ pub struct App {
     /// opens (never per-frame/per-Tick). "System default" is prepended in
     /// the view, not stored here.
     pub(crate) output_devices: Vec<String>,
+    /// Input device names, enumerated on the same schedule as
+    /// `output_devices` and feeding the "Input device" picker (settings
+    /// controls, and the wizard's Intro step).
+    pub(crate) input_devices: Vec<String>,
     /// The player worker's last open/build failure, polled from
     /// `player.last_error()` on every `Tick` (and once on `WindowOpened` so a
     /// pre-existing failure shows immediately instead of waiting for the
@@ -214,21 +234,6 @@ pub struct App {
     /// Calibrate buttons are pressed with no input device open. Cleared the
     /// next time a wizard is actually started.
     pub(crate) wizard_error: Option<String>,
-    /// Set at `WizardStarted` when the default input device's name no longer
-    /// matches `device_name` (the stream itself stays on the old device — see
-    /// the wizard's Intro step, which renders the honest note when this is
-    /// true).
-    pub(crate) device_changed_note: bool,
-    /// Snapshot of `(device_name, tuning_meta, calibration_incomplete)` taken
-    /// right before `WizardStarted` re-keys those fields onto a newly
-    /// noticed device (see `device_changed_note`). `Some` for the duration of
-    /// a wizard that started on a changed device; `teardown_wizard`'s
-    /// discard paths restore it (the engine never actually switched devices,
-    /// so a cancelled wizard must leave the meter/slider keyed to what the
-    /// engine is still listening to), while the finish path
-    /// (`apply_calibration`) clears it without restoring, since the new
-    /// device's calibration was genuinely applied under the new name.
-    pre_wizard_device: Option<(String, TuningMeta, bool)>,
     /// The `Measuring` step's progress value as of the last time it actually
     /// changed (either a fresh `Progress` event, or the last `Tick` that
     /// noticed a change) — compared against on every `Tick` to detect a
@@ -311,6 +316,11 @@ pub enum Message {
     AlertVolumeChanged(f32),
     /// Output device `pick_list` changed; `None` selects the system default.
     OutputDevicePicked(Option<String>),
+    /// Input device `pick_list` changed (settings controls, or the wizard's
+    /// Intro step); `None` selects the system default. Rebuilds the input
+    /// stream onto the new device — here on the UI thread, never in the
+    /// callback.
+    InputDevicePicked(Option<String>),
     /// The settings window's Test button: plays the configured sound at the
     /// configured volume/device, independent of the detector.
     TestSound,
@@ -333,54 +343,18 @@ impl App {
         if first_run {
             let _ = config.save(); // first run: materialize the file for users to find
         }
-        let device_name = audio::default_input_name().unwrap_or_else(|| "unknown input".into());
+        // Provisional: `build_audio` (called once the `App` exists) opens the
+        // stream and re-keys all three off the *resolved* device's name.
+        let device_name = expected_device_name(&config);
         let (tuning_meta, calibration_incomplete) = device_meta(&config, &device_name);
-        let tuning = crate::engine::Tuning {
-            noise_floor_db: tuning_meta.noise_floor_db,
-            quiet_db: tuning_meta.quiet_db,
-            ceiling_db: tuning_meta.ceiling_db,
-            sensitivity: tuning_meta.sensitivity,
-        };
 
         let shared = Arc::new(SharedLevels::default());
-        let (commands, command_rx) = bridge::command_channel();
-        let (events, event_rx) = std::sync::mpsc::channel::<AudioEvent>();
+        // Likewise provisional: `build_audio` installs the real channel
+        // (paired with the callback that drains it) before anything can send.
+        let (commands, _placeholder_rx) = bridge::command_channel();
+        let (audio_events_tx, event_rx) = std::sync::mpsc::channel::<AudioEvent>();
         if let Ok(mut slot) = AUDIO_EVENTS.lock() {
             *slot = Some(event_rx);
-        }
-
-        let mut detector = Detector::new(
-            Engine::with_tuning(tuning),
-            AlertGate::new(config.hold_ms, config.cooldown_ms),
-        );
-        let callback_shared = Arc::clone(&shared);
-        let start = std::time::Instant::now();
-        let stream = audio::start_input(move |frame| {
-            while let Ok(cmd) = command_rx.try_recv() {
-                detector.apply(cmd);
-            }
-            let now_ms = start.elapsed().as_millis() as u64;
-            let outcome = detector.on_frame(frame, now_ms);
-            let threshold_db = detector.threshold_db();
-            callback_shared.store(
-                detector.last_level_db(),
-                threshold_db,
-                detector.peak_db(),
-                detector.drift_db(),
-            );
-            if outcome.beep {
-                let _ = events.send(AudioEvent::Beeped);
-            }
-            if let Some(state) = outcome.state_change {
-                let _ = events.send(AudioEvent::State(state));
-            }
-            if let Some(update) = outcome.measurement {
-                let _ = events.send(AudioEvent::Measurement(update));
-            }
-        })
-        .ok();
-        if let Some(stream) = &stream {
-            let _ = stream.play();
         }
 
         let enabled_item = CheckMenuItem::new("Enabled", true, true, None);
@@ -418,63 +392,66 @@ impl App {
         };
 
         let icons = TrayIconSets::load();
+        // The off icon is the honest starting point: nothing is being
+        // monitored until `build_audio` opens a stream below, and it repaints
+        // the tray (via `refresh_device_meta`) with whatever it actually got.
         let initial_icon_set = if calibration_incomplete { &icons.dotted } else { &icons.plain };
-        // No stream means nothing is being monitored: say so with the off icon.
-        let initial_icon = if stream.is_some() {
-            initial_icon_set.quiet.clone()
-        } else {
-            initial_icon_set.off.clone()
-        };
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("Ragequiet")
-            .with_icon(initial_icon)
+            .with_icon(initial_icon_set.off.clone())
             .build()
             .expect("build tray icon");
 
+        let mut app = Self {
+            tray,
+            enabled_item,
+            menu_ids,
+            settings_window: None,
+            enabled: true,
+            alerts_this_session: 0,
+            test_mode: false,
+            config,
+            device_name,
+            shared,
+            commands,
+            audio_events_tx,
+            stream: None,
+            tuning_meta,
+            icons,
+            latest: (-100.0, f32::NAN, -100.0, f32::NAN),
+            latest_tray_state: TrayState::Quiet,
+            wizard: None,
+            config_dirty: false,
+            calibration_incomplete,
+            today: local_date(),
+            hour: local_hour(),
+            drift_nudge_dismissed: false,
+            sounds,
+            player,
+            custom_sound,
+            custom_sound_rate,
+            sound_error,
+            output_devices: Vec::new(),
+            input_devices: Vec::new(),
+            output_error: None,
+            autostart: autostart::autostart_enabled(),
+            autostart_error: None,
+            wizard_error: None,
+            measure_progress_seen: 0.0,
+            measure_stalled_ticks: 0,
+            cpu_sample: None,
+            cpu_epoch: std::time::Instant::now(),
+            cpu_percent_smoothed: 0.0,
+            cpu_percent_seeded: false,
+        };
+
+        // The one path that opens an input stream — boot and every live
+        // device switch alike, so the callback exists in exactly one place.
+        app.build_audio();
+
         (
-            Self {
-                tray,
-                enabled_item,
-                menu_ids,
-                settings_window: None,
-                enabled: true,
-                alerts_this_session: 0,
-                test_mode: false,
-                config,
-                device_name,
-                shared,
-                commands,
-                stream,
-                tuning_meta,
-                icons,
-                latest: (-100.0, f32::NAN, -100.0, f32::NAN),
-                latest_tray_state: TrayState::Quiet,
-                wizard: None,
-                config_dirty: false,
-                calibration_incomplete,
-                today: local_date(),
-                hour: local_hour(),
-                drift_nudge_dismissed: false,
-                sounds,
-                player,
-                custom_sound,
-                custom_sound_rate,
-                sound_error,
-                output_devices: Vec::new(),
-                output_error: None,
-                autostart: autostart::autostart_enabled(),
-                autostart_error: None,
-                wizard_error: None,
-                device_changed_note: false,
-                pre_wizard_device: None,
-                measure_progress_seen: 0.0,
-                measure_stalled_ticks: 0,
-                cpu_sample: None,
-                cpu_epoch: std::time::Instant::now(),
-                cpu_percent_smoothed: 0.0,
-                cpu_percent_seeded: false,
-            },
+            app,
             // First run opens straight into the wizard's Intro screen via
             // the existing `WizardStarted` handler — reusing it means the
             // no-mic inline error, device naming, and window-open gating
@@ -482,6 +459,117 @@ impl App {
             // launch stays windowless, living in the tray.
             if first_run { Task::done(Message::WizardStarted) } else { Task::none() },
         )
+    }
+
+    /// Opens (or re-opens) the input stream and everything feeding it: a
+    /// fresh command channel, a fresh `Detector`, and the audio callback
+    /// itself. Called from `boot` and from every live device switch — the
+    /// input picker, and a wizard start that finds the OS default has moved.
+    ///
+    /// Always on the UI thread, never from inside the callback: the old
+    /// stream (and its detector) is dropped here and a new one built in its
+    /// place, which is exactly the kind of work the callback must never do.
+    fn build_audio(&mut self) {
+        // A fresh channel per stream: the old receiver dies with the old
+        // callback, so commands can only ever reach the live detector.
+        let (commands, command_rx) = bridge::command_channel();
+        self.commands = commands;
+
+        // The outgoing device's last reading must not linger on the meter or
+        // in the status line while the new stream spins up: both drop back to
+        // their silent/quiet baselines and are re-earned from the new
+        // callback (which the `SetEnabledIconBaseline` below makes it
+        // re-announce rather than wait for a change).
+        self.latest = (-100.0, f32::NAN, -100.0, f32::NAN);
+        self.latest_tray_state = TrayState::Quiet;
+
+        // Which device the open is *expected* to land on. The resolved name
+        // that comes back below is authoritative (a pinned device that isn't
+        // present falls back to the system default), and the `SetTuning`
+        // after a successful open corrects the detector for that case.
+        let expected = expected_device_name(&self.config);
+        let mut detector = Detector::new(
+            Engine::with_tuning(device_tuning(&self.config, &expected)),
+            AlertGate::new(self.config.hold_ms, self.config.cooldown_ms),
+        );
+        // The same `SharedLevels` the UI reads from: the meter, status line
+        // and CPU readout all keep working across a rebuild because every
+        // callback publishes into this one `Arc`.
+        let callback_shared = Arc::clone(&self.shared);
+        // A clone, not the sender itself — the next rebuild needs one too.
+        let events = self.audio_events_tx.clone();
+        let start = std::time::Instant::now();
+        let opened = audio::start_input_on(self.config.input_device.as_deref(), move |frame| {
+            while let Ok(cmd) = command_rx.try_recv() {
+                detector.apply(cmd);
+            }
+            let now_ms = start.elapsed().as_millis() as u64;
+            let outcome = detector.on_frame(frame, now_ms);
+            let threshold_db = detector.threshold_db();
+            callback_shared.store(
+                detector.last_level_db(),
+                threshold_db,
+                detector.peak_db(),
+                detector.drift_db(),
+            );
+            if outcome.beep {
+                let _ = events.send(AudioEvent::Beeped);
+            }
+            if let Some(state) = outcome.state_change {
+                let _ = events.send(AudioEvent::State(state));
+            }
+            if let Some(update) = outcome.measurement {
+                let _ = events.send(AudioEvent::Measurement(update));
+            }
+        });
+
+        match opened {
+            Ok((stream, resolved)) => {
+                // A stream that starts while monitoring is off would feed a
+                // detector the user asked to stop: honour the toggle from
+                // the first frame rather than after one.
+                if self.enabled {
+                    let _ = stream.play();
+                } else {
+                    let _ = stream.pause();
+                }
+                // The old stream is dropped here, by the assignment — after
+                // the new one is open, not before. Two shared-mode capture
+                // clients overlapping for that instant is fine, and it keeps
+                // the gap where nothing is being captured to a minimum.
+                self.stream = Some(stream);
+                // The device that was actually opened is the single source
+                // of truth for which calibration is live.
+                self.device_name = resolved;
+                self.refresh_device_meta();
+                // The new detector starts from scratch, so every piece of
+                // live state it can't see has to be re-announced: the
+                // resolved device's tuning (which differs from `expected`
+                // whenever a pinned device was missing), session-only test
+                // mode, an open wizard's beep suppression, and the icon
+                // baseline so the tray colour is re-earned rather than
+                // inherited from the stream that just went away.
+                let live_tuning = device_tuning(&self.config, &self.device_name);
+                let _ = self.commands.send(Command::SetTuning(live_tuning));
+                let _ = self.commands.send(Command::SetTestMode(self.test_mode));
+                let _ = self.commands.send(Command::SetWizardActive(self.wizard.is_some()));
+                let _ = self.commands.send(Command::SetEnabledIconBaseline);
+            }
+            Err(_) => {
+                // Nothing is listening: `has_stream()` is false, so the
+                // status line reads "No microphone", the meter goes empty
+                // and the tray shows the off icon (via `refresh_device_meta`
+                // below). The app itself keeps running.
+                //
+                // Any previously working stream goes with it. Keeping it
+                // would mean capturing device A while the picker and the
+                // input line both name device B — the user asked to move,
+                // and a failure has to say so rather than quietly carry on.
+                self.stream = None;
+                self.device_name = expected;
+                self.refresh_device_meta();
+            }
+        }
     }
 
     pub fn title(&self, _window: window::Id) -> String {
@@ -533,6 +621,7 @@ impl App {
                 self.today = local_date();
                 self.hour = local_hour();
                 self.output_devices = enumerate_output_devices();
+                self.input_devices = enumerate_input_devices();
                 // The registry is the runtime source of truth: re-read it
                 // every time the window opens so an out-of-band change
                 // (e.g. hand-edited via regedit) is reflected rather than
@@ -667,6 +756,23 @@ impl App {
                 Task::done(Message::WizardEvent(event))
             }
             Message::WizardStarted => {
+                // The device underneath the stream can change between launch
+                // and now (a headset plugged in, a USB mic unplugged). With
+                // no device pinned the stream is supposed to follow the
+                // system default, so rebuild onto it rather than calibrating
+                // against a device the engine isn't listening to. A missing
+                // stream is retried the same way, so a microphone connected
+                // since launch works without a restart.
+                if !self.has_stream()
+                    || default_device_moved(
+                        self.config.input_device.as_deref(),
+                        audio::default_input_name().as_deref(),
+                        &self.device_name,
+                    )
+                {
+                    self.build_audio();
+                }
+
                 // No input device means there is nothing to calibrate
                 // against: show the settings window (so the message is
                 // visible) but never actually enter the wizard, which would
@@ -683,30 +789,6 @@ impl App {
                 // finished result either — restarting is the user choosing
                 // to redo it, not to keep what they had.
                 self.teardown_wizard(false);
-
-                // The default input device can change between launch and
-                // now (a headset plugged in, a USB mic unplugged): re-key
-                // the meter's markers off whatever's current rather than
-                // silently mis-keying against the launch-time device. The
-                // audio stream itself stays on the original device (a full
-                // rebuild is out of scope for v1.0) — the Intro step's note
-                // says so honestly rather than pretending it followed along.
-                let current = audio::default_input_name().unwrap_or_else(|| "unknown input".into());
-                self.device_changed_note = current != self.device_name;
-                if self.device_changed_note {
-                    // The engine keeps running on the original device (see
-                    // the comment on `device_changed_note` above); only the
-                    // meter's markers and the sensitivity slider re-key to
-                    // the new one. Stash what they were keyed to so a
-                    // cancelled/discarded wizard can put them back — without
-                    // this, one slider nudge after a cancelled wizard would
-                    // send anchors for a device the engine isn't listening
-                    // to.
-                    self.pre_wizard_device =
-                        Some((self.device_name.clone(), self.tuning_meta, self.calibration_incomplete));
-                    self.device_name = current;
-                    self.refresh_device_meta();
-                }
 
                 self.measure_progress_seen = 0.0;
                 self.measure_stalled_ticks = 0;
@@ -827,6 +909,21 @@ impl App {
                 self.config.output_device = device;
                 self.config_dirty = true;
                 self.commit_config();
+                Task::none()
+            }
+            Message::InputDevicePicked(device) => {
+                // Re-picking what's already selected must not tear down a
+                // perfectly good stream for nothing.
+                if device != self.config.input_device {
+                    self.config.input_device = device;
+                    self.config_dirty = true;
+                    self.commit_config();
+                    // Swapping the live stream: `build_audio` re-keys
+                    // `device_name`/`tuning_meta` off whatever it actually
+                    // opened, so the meter, sensitivity slider and tray dot
+                    // all follow the new device on the next paint.
+                    self.build_audio();
+                }
                 Task::none()
             }
             Message::TestSound => {
@@ -968,26 +1065,11 @@ impl App {
             let result = *result;
             self.apply_calibration(result);
         }
-        // A device-changed wizard re-keyed `device_name`/`tuning_meta`/
-        // `calibration_incomplete` onto the newly noticed device at
-        // `WizardStarted` (see `pre_wizard_device`). If that wasn't just
-        // applied above (`apply_calibration` clears the stash on the way
-        // out), the wizard is being discarded — cancel, restart, or a window
-        // close/Quit that caught it mid-run — so the engine is still running
-        // on the *original* device and these fields must go back to
-        // matching it, or the next slider nudge sends anchors for a device
-        // nothing is listening to.
-        if let Some((device_name, tuning_meta, calibration_incomplete)) = self.pre_wizard_device.take() {
-            self.device_name = device_name;
-            self.tuning_meta = tuning_meta;
-            self.calibration_incomplete = calibration_incomplete;
-            let icon = if self.enabled && self.stream.is_some() {
-                self.active_icons().for_state(self.latest_tray_state)
-            } else {
-                self.active_icons().off.clone()
-            };
-            let _ = self.tray.set_icon(Some(icon));
-        }
+        // Nothing to un-key on the way out: `device_name`/`tuning_meta` are
+        // only ever set from the device the live stream was actually opened
+        // on (`build_audio`), so a discarded wizard leaves the meter and the
+        // sensitivity slider already matching what the engine is listening
+        // to.
         self.cancel_wizard();
         let _ = self.commands.send(Command::SetWizardActive(false));
     }
@@ -1022,13 +1104,6 @@ impl App {
         // commit point.
         let _ = self.config.save();
 
-        // A device-changed wizard's pre-wizard snapshot (see
-        // `pre_wizard_device`) exists only to be restored if the wizard gets
-        // discarded; this is being applied instead — under `self.device_name`,
-        // which `WizardStarted` already re-keyed to the new device — so the
-        // old device's snapshot is simply dropped rather than restored.
-        self.pre_wizard_device = None;
-
         // Recompute the dot/banner flag and repaint the tray immediately —
         // a calibration finishing must not wait for the next state change to
         // stop showing the dot.
@@ -1056,9 +1131,9 @@ impl App {
     }
 
     /// Re-derives `tuning_meta`/`calibration_incomplete` for `device_name`
-    /// after `Message::WizardStarted` notices it changed underneath a
-    /// running stream — mirrors `boot`'s computation via the same
-    /// `device_meta` helper so the two never drift apart.
+    /// after `build_audio` re-keys it onto the device a freshly opened
+    /// stream actually landed on — one `device_meta` helper for boot,
+    /// device switches and the wizard alike, so they never drift apart.
     fn refresh_device_meta(&mut self) {
         let (meta, incomplete) = device_meta(&self.config, &self.device_name);
         self.tuning_meta = meta;
@@ -1177,7 +1252,7 @@ fn is_first_run(path: Option<&Path>) -> bool {
 /// entry.
 fn device_meta(config: &Config, device_name: &str) -> (TuningMeta, bool) {
     let calibration = config.calibration.get(device_name);
-    let tuning = calibration.map(|c| c.tuning()).unwrap_or_default();
+    let tuning = device_tuning(config, device_name);
     let incomplete = calibration_incomplete_for(config, device_name);
     let meta = TuningMeta {
         noise_floor_db: tuning.noise_floor_db,
@@ -1190,6 +1265,38 @@ fn device_meta(config: &Config, device_name: &str) -> (TuningMeta, bool) {
         sensitivity: tuning.sensitivity,
     };
     (meta, incomplete)
+}
+
+/// The engine tuning a device's stored calibration implies — uncalibrated
+/// defaults when it has no entry (or a half-parsed one; see
+/// `DeviceCalibration::tuning`). The single place both `device_meta` and
+/// `App::build_audio` read it from, so the meter's markers and the detector
+/// can never be keyed off different numbers.
+fn device_tuning(config: &Config, device_name: &str) -> crate::engine::Tuning {
+    config.calibration.get(device_name).map(|c| c.tuning()).unwrap_or_default()
+}
+
+/// The device name `build_audio` expects an open to land on, used to seed the
+/// detector's tuning before the resolved name is known (and as the honest
+/// label when the open fails outright): the pinned device if there is one,
+/// else the current system default.
+fn expected_device_name(config: &Config) -> String {
+    config
+        .input_device
+        .clone()
+        .or_else(audio::default_input_name)
+        .unwrap_or_else(|| "unknown input".into())
+}
+
+/// Whether the live stream should be rebuilt because the device underneath it
+/// moved. Only meaningful with no device pinned (`pinned: None` — the stream
+/// follows the system default), in which case an OS default that no longer
+/// matches what the stream was opened on means "rebuild onto it". A missing
+/// OS default (`os_default: None` — the last microphone was unplugged) also
+/// counts: the rebuild fails and the UI honestly drops to "No microphone"
+/// instead of metering a device that's gone.
+fn default_device_moved(pinned: Option<&str>, os_default: Option<&str>, live: &str) -> bool {
+    pinned.is_none() && os_default != Some(live)
 }
 
 /// True when the active device's calibration is missing, `BaselineOnly`, or
@@ -1212,6 +1319,16 @@ fn calibration_incomplete_for(config: &Config, device_name: &str) -> bool {
 fn enumerate_output_devices() -> Vec<String> {
     cpal::default_host()
         .output_devices()
+        .map(|devices| devices.map(|d| d.to_string()).collect())
+        .unwrap_or_default()
+}
+
+/// Input device names, for the "Input device" picker in both the settings
+/// controls and the wizard's Intro step. Enumerated on the same schedule as
+/// `enumerate_output_devices` (window open only), never per-frame.
+fn enumerate_input_devices() -> Vec<String> {
+    cpal::default_host()
+        .input_devices()
         .map(|devices| devices.map(|d| d.to_string()).collect())
         .unwrap_or_default()
 }
@@ -1628,6 +1745,67 @@ mod tests {
         assert_eq!(meta.ceiling_db, Some(-18.0));
         assert!(meta.ceiling_confirmed);
         assert_eq!(meta.sensitivity, 0.7);
+    }
+
+    #[test]
+    fn pinned_device_never_follows_the_os_default() {
+        // An explicit choice outranks the OS: the stream stays where the
+        // user put it even when the default moves elsewhere.
+        assert!(!default_device_moved(Some("Mic A"), Some("Mic B"), "Mic A"));
+        assert!(!default_device_moved(Some("Mic A"), None, "Mic A"));
+    }
+
+    #[test]
+    fn unpinned_device_stays_put_while_the_default_is_unchanged() {
+        assert!(!default_device_moved(None, Some("Mic A"), "Mic A"));
+    }
+
+    #[test]
+    fn unpinned_device_follows_a_moved_default() {
+        assert!(default_device_moved(None, Some("Mic B"), "Mic A"));
+    }
+
+    #[test]
+    fn unpinned_device_with_no_default_left_counts_as_moved() {
+        // The last microphone was unplugged: rebuilding fails and the UI
+        // honestly drops to "No microphone".
+        assert!(default_device_moved(None, None, "Mic A"));
+    }
+
+    #[test]
+    fn expected_device_name_prefers_the_pinned_device() {
+        let config = Config { input_device: Some("Headset".into()), ..Config::default() };
+        assert_eq!(expected_device_name(&config), "Headset");
+    }
+
+    #[test]
+    fn device_tuning_falls_back_to_uncalibrated_defaults() {
+        let config = Config::default();
+        let tuning = device_tuning(&config, "Mic");
+        let default = crate::engine::Tuning::default();
+        assert_eq!(tuning.quiet_db, default.quiet_db);
+        assert_eq!(tuning.ceiling_db, default.ceiling_db);
+        assert_eq!(tuning.noise_floor_db, default.noise_floor_db);
+        assert_eq!(tuning.sensitivity, default.sensitivity);
+    }
+
+    #[test]
+    fn device_tuning_reads_the_devices_own_entry() {
+        let mut config = Config::default();
+        config.calibration.insert(
+            "Mic".into(),
+            DeviceCalibration {
+                state: CalibrationState::CeilingSet,
+                quiet_db: -34.0,
+                ceiling_db: Some(-18.0),
+                noise_floor_db: -58.0,
+                sensitivity: 0.7,
+            },
+        );
+        let tuning = device_tuning(&config, "Mic");
+        assert_eq!(tuning.quiet_db, Some(-34.0));
+        assert_eq!(tuning.ceiling_db, Some(-18.0));
+        assert_eq!(tuning.sensitivity, 0.7);
     }
 
     #[test]

@@ -15,8 +15,9 @@ use crate::sounds;
 use crate::ui::meter::Meter;
 use crate::ui::theme::{BACKGROUND, FONT_REGULAR, FONT_SEMIBOLD, GREEN, RED, SURFACE, TEXT, TEXT_MUTED, YELLOW};
 
-/// "System default" is the picker's sentinel text for `output_device: None`;
-/// no real cpal device is expected to collide with this label.
+/// "System default" is the device pickers' sentinel text for a `None`
+/// `input_device`/`output_device`; no real cpal device is expected to collide
+/// with this label.
 const SYSTEM_DEFAULT_DEVICE: &str = "System default";
 
 /// Which reminder banner (if any) should show. Only one shows at a time: the
@@ -58,9 +59,11 @@ pub fn view(app: &App) -> Element<'_, Message> {
         Some(wizard) => crate::ui::calibrate::view(
             wizard,
             meter_panel(app),
+            // The Intro step renders this; every later step drops it, so a
+            // device can't be switched out from under a running measurement.
+            input_device_block(app, false),
             !app.enabled || !app.has_stream(),
             app.wizard_stall_hint(),
-            app.device_changed_note,
         ),
         None => {
             let mut col = column![].spacing(12).width(Length::Fill);
@@ -78,23 +81,23 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 .push(cooldown_block(app))
                 .push(alert_sound_block(app))
                 .push(alert_volume_block(app))
+                .push(input_device_block(app, true))
                 .push(output_device_block(app))
                 .push(test_mode_row(app))
                 .push(autostart_block(app))
-                .push(input_line(app))
                 .push(cpu_line(app))
                 .into()
         }
     };
 
-    // The default controls stack (no banner, no wizard error) fits inside the
-    // 400x760 window on its own — meter/status/alerts/sensitivity/hold/
-    // cooldown/sound/volume/output-device/test-mode/autostart/input/CPU is 13
-    // rows at 12px spacing, comfortably under the ~680px available once the
-    // chrome bar and body padding are subtracted. This scrollable is a safety
-    // net, not the primary layout: if a banner, wrapped alert copy, or a long
-    // device name ever pushes the body past the fold anyway, every control
-    // (including Cancel/Finish) still stays reachable instead of clipping.
+    // The default controls stack (no banner, no wizard error) is meter/
+    // status/alerts/sensitivity/hold/cooldown/sound/volume/input-device/
+    // output-device/test-mode/autostart/CPU — 13 rows at 12px spacing, close
+    // to the ~680px available once the chrome bar and body padding are
+    // subtracted. This scrollable is what makes that safe rather than tight:
+    // if a banner, wrapped alert copy, or a long device name pushes the body
+    // past the fold, every control (including Cancel/Finish) still stays
+    // reachable instead of clipping.
     // The chrome row lives outside this scrollable so the window stays
     // movable/closable no matter how tall the body gets.
     let scrollable_body = scrollable(body)
@@ -586,15 +589,59 @@ fn autostart_block(app: &App) -> Element<'_, Message> {
     block.into()
 }
 
-fn input_line(app: &App) -> Element<'_, Message> {
-    // The device name is arbitrary, driver-supplied text (easily 60+ chars);
-    // an explicit fill width lets it wrap across lines instead of clipping.
-    text(format!("Input: {}", app.device_name))
-        .font(FONT_REGULAR)
-        .size(12)
-        .color(TEXT_MUTED)
-        .width(Length::Fill)
-        .into()
+/// "Input device" picker: "System default" (maps to `input_device: None`)
+/// plus every device `Message::WindowOpened` enumerated, exactly like the
+/// output picker. Picking rebuilds the live input stream (see
+/// `Message::InputDevicePicked`).
+///
+/// `with_recalibrate` adds the Recalibrate button beside the picker for the
+/// settings controls; the wizard's Intro step renders the same block without
+/// it (it *is* the calibration).
+///
+/// A muted line underneath names the device actually being captured from,
+/// but only when that isn't already what the picker reads: with "System
+/// default" selected it says which mic that resolved to, and if a pinned
+/// device has gone missing it admits the fallback rather than showing a
+/// selection nothing is listening to.
+fn input_device_block(app: &App, with_recalibrate: bool) -> Element<'_, Message> {
+    let mut options = vec![SYSTEM_DEFAULT_DEVICE.to_string()];
+    options.extend(app.input_devices.iter().cloned());
+
+    let selected = app.config.input_device.clone().unwrap_or_else(|| SYSTEM_DEFAULT_DEVICE.to_string());
+
+    let picker = pick_list(options, Some(selected), |choice: String| {
+        Message::InputDevicePicked(if choice == SYSTEM_DEFAULT_DEVICE { None } else { Some(choice) })
+    })
+    .font(FONT_REGULAR)
+    .text_size(13)
+    .width(Length::Fill);
+
+    let control: Element<'_, Message> = if with_recalibrate {
+        let recalibrate = button(text("Recalibrate").font(FONT_REGULAR).size(13))
+            .padding([4.0, 12.0])
+            .style(crate::ui::calibrate::secondary_button_style)
+            .on_press(Message::WizardStarted);
+        row![picker, recalibrate].spacing(8).align_y(Alignment::Center).into()
+    } else {
+        picker.into()
+    };
+
+    let mut block =
+        column![text("Input device").font(FONT_REGULAR).size(13).color(TEXT), control].spacing(6);
+
+    if app.config.input_device.as_deref() != Some(app.device_name.as_str()) {
+        // The device name is arbitrary, driver-supplied text (easily 60+
+        // chars); an explicit fill width lets it wrap instead of clipping.
+        block = block.push(
+            text(format!("Using: {}", app.device_name))
+                .font(FONT_REGULAR)
+                .size(12)
+                .color(TEXT_MUTED)
+                .width(Length::Fill),
+        );
+    }
+
+    block.into()
 }
 
 /// This process's own CPU usage (spec §7), smoothed on `Tick` — see
