@@ -59,6 +59,14 @@ pub struct Engine {
     /// `baseline_drift_db` just reads this back — no second median
     /// computation per frame.
     last_drift_db: f32,
+    /// The most recent frame's real dB level, set unconditionally at the top
+    /// of `process` (before the noise-gate/VAD early returns) — unlike
+    /// `State`'s per-variant `db` field, this exists even when the frame was
+    /// classified `Quiet`. -100.0 (matching `db_from_rms`'s own floor)
+    /// before the first frame. Exposed via `last_frame_db` so callers (the
+    /// meter, the level-history graph) can show the room's genuine ambient
+    /// level during silence instead of a sentinel.
+    last_frame_db: f32,
 }
 
 /// Voiced frames stuck above the feed cutoff (but not bright) for this many
@@ -80,6 +88,7 @@ impl Engine {
             tuning,
             unfed_streak: 0,
             last_drift_db: f32::NAN,
+            last_frame_db: -100.0,
         }
     }
 
@@ -139,8 +148,20 @@ impl Engine {
         self.last_drift_db
     }
 
+    /// The most recent frame's real dB level, including frames the cascade
+    /// rejected as `Quiet` (below the noise gate, or not voice) — see the
+    /// `last_frame_db` field doc for why this exists alongside `State`.
+    pub fn last_frame_db(&self) -> f32 {
+        self.last_frame_db
+    }
+
     pub fn process(&mut self, frame: &[f32]) -> State {
         let db = db_from_rms(rms(frame));
+        // Recorded unconditionally, before either early return below, so a
+        // frame that gets classified `Quiet` still leaves behind its real
+        // ambient level rather than only the sentinel `State::Quiet` itself
+        // implies.
+        self.last_frame_db = db;
         if db < self.tuning.noise_floor_db + 3.0 {
             return State::Quiet;
         }

@@ -22,11 +22,15 @@ pub const HISTORY_CAPACITY: usize = 375;
 
 /// A level reading at/below this is the "no live data" placeholder
 /// (`App::latest`'s -100.0 default while paused, no device is open, or the
-/// window just opened/switched devices before the first real sample), not a
-/// genuine near-floor-quiet reading — real captured audio never goes below
-/// `norm`'s own -70 dB domain floor. A segment with both endpoints at/below
-/// this is skipped so a paused/deviceless stretch doesn't draw a flat
-/// colored line that reads as a real (very quiet) signal.
+/// window just opened/switched devices before the first real sample) — not a
+/// genuine ambient reading. `Detector::last_level_db` reports the real dB of
+/// every frame unconditionally, including ones the cascade classifies
+/// `Quiet` (see `Engine::last_frame_db`), so ordinary silence/ambient noise
+/// shows up as its own real (if very low) level, comfortably above this
+/// cutoff — -100 itself only appears when nothing is actually being
+/// captured. A segment with both endpoints at/below this is skipped so a
+/// paused/deviceless stretch doesn't draw a flat colored line that reads as
+/// a real signal.
 const SENTINEL_DB: f32 = -99.0;
 
 /// Everything the history graph draws: the trailing samples (oldest at the
@@ -286,13 +290,18 @@ mod tests {
 
     #[test]
     fn genuine_quiet_reading_is_not_treated_as_sentinel() {
-        // -70 dB is `norm`'s own floor (genuinely quiet audio), well above
-        // SENTINEL_DB (-99.0) — must still draw.
+        // A pair of samples like `Detector::last_level_db` now actually
+        // publishes during ordinary `State::Quiet` frames — real ambient
+        // noise (e.g. -65 dB), not the old -100 sentinel. Well above
+        // SENTINEL_DB (-99.0), so both the segment draws and, since it's far
+        // under the threshold, colors GREEN rather than being skipped as if
+        // it were "no live data".
         let mut samples = VecDeque::new();
-        samples.push_back((-70.0, -27.0));
-        samples.push_back((-68.0, -27.0));
+        samples.push_back((-65.0, -27.0));
+        samples.push_back((-63.0, -27.0));
         let segments = build_segments(&samples, 375, 300.0, 120.0, INSET);
         assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].color, crate::ui::theme::GREEN);
     }
 
     #[test]

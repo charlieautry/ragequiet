@@ -37,18 +37,16 @@ pub enum MeasurementUpdate {
     Complete(MeasurementKind, f32),
 }
 
-/// Level reported for frames the cascade rejected (silence / non-voice).
+/// `peak_db`'s value before the first frame arrives — matches
+/// `db_from_rms`'s own floor for literal digital silence. Ordinary `Quiet`
+/// frames no longer report this: `Detector::last_level_db` reads the
+/// engine's real per-frame level (`Engine::last_frame_db`) unconditionally,
+/// so this sentinel only ever shows up pre-first-frame, never as a stand-in
+/// for ambient noise.
 pub const SILENT_DB: f32 = -100.0;
 
 /// How long a ghost peak lingers before it decays back to the live level.
 const PEAK_HOLD_MS: u64 = 3000;
-
-fn level_of(state: State) -> f32 {
-    match state {
-        State::Quiet => SILENT_DB,
-        State::Calm { db } | State::GettingLoud { db } | State::TooLoud { db } => db,
-    }
-}
 
 /// Owns all per-frame state so the audio callback stays a thin shim
 /// and the logic is testable without an audio device.
@@ -57,7 +55,6 @@ pub struct Detector {
     gate: AlertGate,
     last_state: Option<TrayState>,
     test_mode: bool,
-    last_level_db: f32,
     peak_db: f32,
     peak_at_ms: u64,
     /// Active calibration measurement, if any: kind, the pure accumulator,
@@ -78,7 +75,6 @@ impl Detector {
             gate,
             last_state: Some(TrayState::Quiet),
             test_mode: false,
-            last_level_db: SILENT_DB,
             peak_db: SILENT_DB,
             peak_at_ms: 0,
             measurement: None,
@@ -122,12 +118,23 @@ impl Detector {
             .update(matches!(state, State::TooLoud { .. }), now_ms)
             && !self.test_mode
             && !(measuring || self.wizard_active);
-        let level_db = level_of(state);
-        self.last_level_db = level_db;
-        // `>=`, not `>`: a frame that merely ties the peak is still a fresh
-        // sighting of it, and must restart the 3 s window rather than let a
-        // steady level age out from under itself.
-        if level_db >= self.peak_db || now_ms.saturating_sub(self.peak_at_ms) > PEAK_HOLD_MS {
+        let level_db = self.engine.last_frame_db();
+        // A fresh "sighting" of a new/tied peak only counts for voiced
+        // (non-`Quiet`) levels: `Quiet` frames now report their real ambient
+        // dB rather than the old sentinel, and without this guard ordinary
+        // room noise could get mistaken for a loud moment and keep resetting
+        // the peak's hold window, never letting it decay. `>=`, not `>`: a
+        // frame that merely ties the peak is still a fresh sighting of it,
+        // and must restart the 3 s window rather than let a steady level age
+        // out from under itself.
+        //
+        // The stale-decay branch below is purely time-based and runs
+        // regardless of state, settling the peak back to whatever the live
+        // level honestly is right now — ambient dB during `Quiet` included —
+        // once nothing loud has been seen in `PEAK_HOLD_MS`.
+        if (!matches!(state, State::Quiet) && level_db >= self.peak_db)
+            || now_ms.saturating_sub(self.peak_at_ms) > PEAK_HOLD_MS
+        {
             self.peak_db = level_db;
             self.peak_at_ms = now_ms;
         }
@@ -148,9 +155,13 @@ impl Detector {
         self.gate.reset();
     }
 
-    /// dB of the most recent frame; `SILENT_DB` when the cascade said Quiet.
+    /// dB of the most recent frame, including ambient noise the cascade
+    /// classified as `Quiet` (below the noise gate, or not voice) — the
+    /// engine records its real level unconditionally every frame (see
+    /// `Engine::last_frame_db`), so this is always the genuine room level,
+    /// never a sentinel standing in for it.
     pub fn last_level_db(&self) -> f32 {
-        self.last_level_db
+        self.engine.last_frame_db()
     }
 
     /// Live threshold including adaptive drift (`&mut`: the median is lazy).
@@ -334,12 +345,51 @@ mod tests {
         }
         assert_eq!(d.peak_db(), voiced_peak, "peak must hold for ~3 s");
 
-        // past 3 s it decays to the live (silent) level
+        // past 3 s it decays to the live level — `silence()` is literal
+        // digital zero, which floors at exactly `SILENT_DB` in
+        // `db_from_rms` itself (not a `Quiet`-classification artifact), so
+        // this is still the right target even though ordinary `Quiet`
+        // frames now report their own real ambient dB instead (see
+        // `quiet_frame_reports_its_real_ambient_db_not_a_sentinel` below).
         for _ in 0..(2000 / FRAME_MS) {
             d.on_frame(&silence(), now);
             now += FRAME_MS;
         }
         assert_eq!(d.peak_db(), SILENT_DB, "stale peak must decay");
+    }
+
+    #[test]
+    fn quiet_frame_reports_its_real_ambient_db_not_a_sentinel() {
+        let mut d = test_detector();
+        // Well under the default noise gate (noise_floor -55 + 3 dB, so
+        // anything below -52 dB reads Quiet) — but it's real, measurable
+        // ambient noise, not literal digital silence.
+        let faint = mix(16000.0, FRAME_SIZE, &[(200.0, 0.0005)]); // ~-69 dB
+        d.on_frame(&faint, 0);
+        let level = d.last_level_db();
+        assert!(level > -90.0, "quiet frame must not report the old -100 sentinel, got {level}");
+        assert!((level - (-69.0)).abs() < 5.0, "expected the frame's real ~-69 dB level, got {level}");
+    }
+
+    #[test]
+    fn ambient_noise_during_quiet_does_not_refresh_the_ghost_peak() {
+        // A voiced peak is set, then quiet (but non-zero) ambient noise
+        // plays for under the hold window: the peak must still be holding
+        // (proving ambient dB isn't being mistaken for a fresh "sighting"
+        // that would keep resetting peak_at_ms), not stuck at the ambient
+        // level from the very first quiet frame.
+        let mut d = test_detector();
+        let end = warm_up(&mut d);
+        let voiced_peak = d.peak_db();
+        assert!(voiced_peak > -60.0 && voiced_peak.is_finite(), "got {voiced_peak}");
+
+        let faint = mix(16000.0, FRAME_SIZE, &[(200.0, 0.0005)]); // ~-69 dB, classified Quiet
+        let mut now = end;
+        for _ in 0..(2000 / FRAME_MS) {
+            d.on_frame(&faint, now);
+            now += FRAME_MS;
+        }
+        assert_eq!(d.peak_db(), voiced_peak, "ambient noise during Quiet must not touch the ghost peak early");
     }
 
     #[test]
