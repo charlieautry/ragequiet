@@ -323,9 +323,14 @@ pub enum Message {
 impl App {
     pub fn boot() -> (Self, Task<Message>) {
         let config = Config::load();
-        if let Some(path) = Config::path()
-            && !path.exists()
-        {
+        // The config file's absence is the first-run signal: nothing has
+        // ever saved it before, so this launch both materializes the
+        // default file and routes into the setup wizard below instead of a
+        // windowless tray start (an autostarted instance at login already
+        // has a config from its first interactive launch, so this is false
+        // and it starts to the tray as usual).
+        let first_run = is_first_run(Config::path().as_deref());
+        if first_run {
             let _ = config.save(); // first run: materialize the file for users to find
         }
         let device_name = audio::default_input_name().unwrap_or_else(|| "unknown input".into());
@@ -470,7 +475,12 @@ impl App {
                 cpu_percent_smoothed: 0.0,
                 cpu_percent_seeded: false,
             },
-            Task::none(), // no window at launch: the app lives in the tray
+            // First run opens straight into the wizard's Intro screen via
+            // the existing `WizardStarted` handler — reusing it means the
+            // no-mic inline error, device naming, and window-open gating
+            // all apply exactly as they do from the tray menu. Every other
+            // launch stays windowless, living in the tray.
+            if first_run { Task::done(Message::WizardStarted) } else { Task::none() },
         )
     }
 
@@ -1151,6 +1161,15 @@ fn calibration_from_result(result: &WizardResult, prior_sensitivity: Option<f32>
     }
 }
 
+/// True when `path` names a config file that doesn't exist yet — the
+/// first-run signal `boot` uses to route into the setup wizard instead of a
+/// windowless tray start. `None` (no `APPDATA`, so `Config::path` has
+/// nowhere to point) is not first-run: there's nowhere to materialize a
+/// config file either, so this behaves like every other launch.
+fn is_first_run(path: Option<&Path>) -> bool {
+    path.is_some_and(|p| !p.exists())
+}
+
 /// Computes the meter's markers (`TuningMeta`) and the calibration-incomplete
 /// flag for a device from its calibration entry (or lack of one). Shared by
 /// `boot` and `App::refresh_device_meta` (the wizard's device re-read) so a
@@ -1367,6 +1386,26 @@ fn audio_event_subscription() -> Subscription<Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_first_run_true_when_path_does_not_exist() {
+        let path = std::env::temp_dir().join("ragequiet_boot_test_missing_config.toml");
+        let _ = std::fs::remove_file(&path); // ensure a clean slate regardless of prior runs
+        assert!(is_first_run(Some(&path)));
+    }
+
+    #[test]
+    fn is_first_run_false_when_path_exists() {
+        let path = std::env::temp_dir().join("ragequiet_boot_test_existing_config.toml");
+        std::fs::write(&path, "").unwrap();
+        assert!(!is_first_run(Some(&path)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn is_first_run_false_when_no_path() {
+        assert!(!is_first_run(None));
+    }
 
     fn meta(quiet_db: Option<f32>, ceiling_db: Option<f32>, sensitivity: f32) -> TuningMeta {
         TuningMeta { noise_floor_db: -55.0, quiet_db, ceiling_db, ceiling_confirmed: false, sensitivity }
