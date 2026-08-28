@@ -269,6 +269,13 @@ pub enum Message {
     /// Emitted by the chrome row's drag handle (a `mouse_area` over the
     /// title/spacer region); moves the borderless settings window.
     DragWindow,
+    /// Emitted by an edge/corner resize handle: this window's `decorations:
+    /// false` zeroes out its non-client area, so Windows' own edge hit-testing
+    /// never fires (verified against winit 0.30 — `WM_NCHITTEST` reports
+    /// `HTCLIENT` all the way to the last pixel rather than `HTRIGHT`/
+    /// `HTBOTTOM`/etc.); this drives the OS resize loop directly instead,
+    /// the same way `DragWindow` drives the OS move loop.
+    ResizeWindow(window::Direction),
     /// Emitted by the chrome row's close button.
     CloseSettings,
     /// Emitted on slider release: the single point where a config edit is
@@ -620,6 +627,10 @@ impl App {
                 Some(id) => window::drag(id),
                 None => Task::none(),
             },
+            Message::ResizeWindow(direction) => match self.settings_window {
+                Some(id) => window::drag_resize(id, direction),
+                None => Task::none(),
+            },
             Message::CloseSettings => match self.settings_window {
                 Some(id) => window::close(id),
                 None => Task::none(),
@@ -877,7 +888,8 @@ impl App {
         }
         let (_, open) = window::open(window::Settings {
             size: iced::Size::new(400.0, 760.0),
-            resizable: false,
+            resizable: true,
+            min_size: Some(iced::Size::new(360.0, 480.0)),
             decorations: false,
             icon: Some(ui::icons::window_icon()),
             ..window::Settings::default()

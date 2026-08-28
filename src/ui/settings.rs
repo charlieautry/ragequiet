@@ -4,9 +4,10 @@
 //! here; Task 4 mounts the real canvas.
 
 use iced::widget::{
-    button, canvas, column, container, mouse_area, pick_list, row, scrollable, slider, space, text, toggler,
+    button, canvas, column, container, mouse_area, pick_list, row, scrollable, slider, space, stack, text, toggler,
 };
-use iced::{Alignment, Element, Length, Theme};
+use iced::window::Direction as ResizeDirection;
+use iced::{Alignment, Element, Length, Theme, mouse};
 
 use crate::app::{banner_visible, drift_nudge_visible, meta_threshold_db, App, Message, SoundChoice};
 use crate::detector::TrayState;
@@ -110,15 +111,83 @@ pub fn view(app: &App) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill);
 
-    container(content)
+    let window_body = container(content)
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(24)
         .style(|_theme: &Theme| container::Style {
             background: Some(BACKGROUND.into()),
             ..container::Style::default()
-        })
-        .into()
+        });
+
+    // Invisible edge/corner strips layered over everything so the window can
+    // still be resized (see `resize_handles`'s doc comment for why the OS's
+    // own edge hit-testing doesn't do this for us).
+    stack![window_body, resize_handles()].into()
+}
+
+/// Edge and corner drag-resize strips for the borderless settings window.
+///
+/// A decorated (native-chrome) window gets ~8px invisible resize borders for
+/// free from Windows' own `WM_NCHITTEST` handling. This window turns
+/// decorations off, and winit implements that by having `WM_NCCALCSIZE`
+/// claim the *entire* window rect as client area (see winit 0.30's
+/// `platform_impl::windows::event_loop`, the `WM_NCCALCSIZE` arm: it returns
+/// `Value(0)` — "no non-client area" — whenever `MARKER_DECORATIONS` is
+/// unset). Verified empirically too: probing `WM_NCHITTEST` one pixel in
+/// from the live window's right edge returns `HTCLIENT` (1), never `HTRIGHT`
+/// (11), even with `resizable: true` and `WS_SIZEBOX` set on the HWND — so
+/// there is no native resize border left to rely on here.
+///
+/// The fallback is the same trick the chrome row's drag handle already uses
+/// for moving the window: `iced::window::drag_resize` hands off to the OS's
+/// modal resize loop directly (winit's `drag_resize_window`, which posts a
+/// synthetic `WM_NCLBUTTONDOWN` with the matching `HT*` code) rather than
+/// depending on hit-testing at all. Each strip below is a thin `mouse_area`
+/// pinned to one edge or corner via `container`'s alignment, stacked over
+/// the whole window; only its own narrow band intercepts the cursor; every
+/// pixel outside the bands reaches the normal UI underneath untouched.
+fn resize_handles<'a>() -> Element<'a, Message> {
+    const EDGE: f32 = 6.0;
+    const CORNER: f32 = 10.0;
+
+    // A thin `mouse_area` of the given size, pinned to one edge/corner of
+    // the whole window via `container`'s alignment (the container itself is
+    // Fill-sized so the alignment has room to push the strip to the edge;
+    // only the strip's own small bounds intercept the cursor).
+    let handle = |width: Length,
+                  height: Length,
+                  align_x: Alignment,
+                  align_y: Alignment,
+                  interaction: mouse::Interaction,
+                  direction: ResizeDirection| {
+        let strip = mouse_area(space::Space::new().width(width).height(height))
+            .interaction(interaction)
+            .on_press(Message::ResizeWindow(direction));
+
+        container(strip).width(Length::Fill).height(Length::Fill).align_x(align_x).align_y(align_y)
+    };
+
+    use mouse::Interaction::{ResizingDiagonallyDown, ResizingDiagonallyUp, ResizingHorizontally, ResizingVertically};
+    use ResizeDirection::{East, North, NorthEast, NorthWest, South, SouthEast, SouthWest, West};
+
+    let edge = Length::Fixed(EDGE);
+    let corner = Length::Fixed(CORNER);
+
+    stack![
+        // Edges: full-length strips along each side.
+        handle(edge, Length::Fill, Alignment::End, Alignment::Center, ResizingHorizontally, East),
+        handle(edge, Length::Fill, Alignment::Start, Alignment::Center, ResizingHorizontally, West),
+        handle(Length::Fill, edge, Alignment::Center, Alignment::Start, ResizingVertically, North),
+        handle(Length::Fill, edge, Alignment::Center, Alignment::End, ResizingVertically, South),
+        // Corners: small squares layered on top of (and overriding) the edge
+        // strips right at the corners, one per diagonal.
+        handle(corner, corner, Alignment::Start, Alignment::Start, ResizingDiagonallyDown, NorthWest),
+        handle(corner, corner, Alignment::End, Alignment::Start, ResizingDiagonallyUp, NorthEast),
+        handle(corner, corner, Alignment::Start, Alignment::End, ResizingDiagonallyUp, SouthWest),
+        handle(corner, corner, Alignment::End, Alignment::End, ResizingDiagonallyDown, SouthEast),
+    ]
+    .into()
 }
 
 /// The custom title bar: draggable title region on the left, flat close
