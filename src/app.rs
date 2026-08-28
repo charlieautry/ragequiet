@@ -168,6 +168,16 @@ pub struct App {
     /// (level_db, threshold_db, peak_db, drift_db) sampled on Tick so `view`
     /// stays pure.
     pub(crate) latest: (f32, f32, f32, f32),
+    /// Trailing (level_db, threshold_db) samples for the settings window's
+    /// history graph — oldest at the front, newest at the back, capped at
+    /// `ui::history::HISTORY_CAPACITY` (30 s at the 80 ms Tick cadence).
+    /// Each sample keeps the threshold it was taken against, since a past
+    /// segment's color must not be rewritten by a threshold that has since
+    /// moved. Pushed on `Tick` (so it costs nothing while the window is
+    /// closed, same as `latest`); cleared on `WindowOpened` (a fresh view per
+    /// open) and in `build_audio` (a device switch must not continue the old
+    /// device's trace).
+    pub(crate) history: std::collections::VecDeque<(f32, f32)>,
     /// Last tray state seen, for the settings window's status line.
     pub(crate) latest_tray_state: TrayState,
     /// Some while the calibration wizard owns the settings window's body.
@@ -420,6 +430,7 @@ impl App {
             tuning_meta,
             icons,
             latest: (-100.0, f32::NAN, -100.0, f32::NAN),
+            history: std::collections::VecDeque::with_capacity(ui::history::HISTORY_CAPACITY),
             latest_tray_state: TrayState::Quiet,
             wizard: None,
             config_dirty: false,
@@ -481,6 +492,8 @@ impl App {
         // callback (which the `SetEnabledIconBaseline` below makes it
         // re-announce rather than wait for a change).
         self.latest = (-100.0, f32::NAN, -100.0, f32::NAN);
+        // A new device's trace must not continue the old one's.
+        self.history.clear();
         self.latest_tray_state = TrayState::Quiet;
 
         // Which device the open is *expected* to land on. The resolved name
@@ -618,6 +631,9 @@ impl App {
                 // published, instead of the boot-time silence sentinel —
                 // avoids a stale reading from before the window existed.
                 self.latest = self.shared.load();
+                // A fresh view per open: the trace shouldn't pick up wherever
+                // it left off from a previous session with the window.
+                self.history.clear();
                 self.today = local_date();
                 self.hour = local_hour();
                 self.output_devices = enumerate_output_devices();
@@ -647,6 +663,14 @@ impl App {
             }
             Message::Tick => {
                 self.latest = self.shared.load();
+                // History sampling rides this existing window-gated Tick —
+                // no new subscription, and it costs nothing while the window
+                // is closed (Tick doesn't fire then).
+                let (level_db, threshold_db, _peak_db, _drift_db) = self.latest;
+                self.history.push_back((level_db, threshold_db));
+                while self.history.len() > ui::history::HISTORY_CAPACITY {
+                    self.history.pop_front();
+                }
                 self.today = local_date();
                 self.hour = local_hour();
                 // The window is only open while Tick fires, so this costs

@@ -12,6 +12,7 @@ use iced::{Alignment, Element, Length, Theme, mouse};
 use crate::app::{banner_visible, drift_nudge_visible, meta_threshold_db, App, Message, SoundChoice};
 use crate::detector::TrayState;
 use crate::sounds;
+use crate::ui::history::{History, HISTORY_CAPACITY};
 use crate::ui::meter::Meter;
 use crate::ui::theme::{BACKGROUND, FONT_REGULAR, FONT_SEMIBOLD, GREEN, RED, SURFACE, TEXT, TEXT_MUTED, YELLOW};
 
@@ -74,6 +75,7 @@ pub fn view(app: &App) -> Element<'_, Message> {
                 col = col.push(banner);
             }
             col.push(meter_panel(app))
+                .push(history_panel(app))
                 .push(status_line(app))
                 .push(alerts_line(app))
                 .push(sensitivity_block(app))
@@ -371,6 +373,23 @@ fn meter_panel(app: &App) -> Element<'_, Message> {
     })
     .width(Length::Fill)
     .height(Length::Fixed(48.0))
+    .into()
+}
+
+/// The level-history graph: a scrolling ~30 s trace of `app.history`,
+/// mounted directly below the meter. Controls view only — the wizard has its
+/// own live meter already (via `meter_panel` handed into `calibrate::view`)
+/// and stays uncluttered without this.
+fn history_panel(app: &App) -> Element<'_, Message> {
+    canvas(History {
+        samples: &app.history,
+        capacity: HISTORY_CAPACITY,
+        noise_floor_db: app.tuning_meta.noise_floor_db,
+        ceiling_db: app.tuning_meta.ceiling_db,
+        ceiling_confirmed: app.tuning_meta.ceiling_confirmed,
+    })
+    .width(Length::Fill)
+    .height(Length::Fixed(120.0))
     .into()
 }
 
